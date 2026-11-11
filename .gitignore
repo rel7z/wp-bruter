@@ -1,5 +1,9 @@
 .gocache/
 wp-bruter-linux
-wp-bruter
+wp-bruter-new
 .DS_Store
 *.exe
+bruter.go
+go.mod
+go.sum
+deploy.sh
