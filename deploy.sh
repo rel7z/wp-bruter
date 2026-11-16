@@ -71,6 +71,7 @@ for WORKER in "${WORKERS[@]}"; do
         ssh_cmd "$WORKER" "
             mv -f /opt/wp-bruter/wp-bruter.new /opt/wp-bruter/wp-bruter
             chmod +x /opt/wp-bruter/wp-bruter
+            pkill -9 -f "run.sh" 2>/dev/null || true
             pkill -9 wp-bruter 2>/dev/null || true
             # A SIGTERM drain can take a while (in-flight 5s requests); -9 is
             # immediate, but wait for the PID to disappear before restarting so

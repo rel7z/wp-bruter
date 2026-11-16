@@ -19,5 +19,8 @@ for LIM in ${PHASES:-150 500 0}; do
         -max-attempts "$LIM" \
         -timeout 5 \
         -verbose >> attack.log 2>&1
+    # Wait for this phase's process to disappear before the next one starts,
+    # otherwise the PID guard refuses it and the pass is skipped.
+    for _ in $(seq 1 40); do pgrep -f "wp-bruter -sites" >/dev/null || break; sleep 1; done
     sleep 2
 done
