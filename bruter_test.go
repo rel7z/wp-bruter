@@ -139,13 +139,15 @@ func TestCheckpointRoundTrip(t *testing.T) {
 	}
 
 	cases := map[string]bool{
-		"verified_success": false,
-		"not_wordpress":    false,
-		"done":             false,
-		"network_error":    true,
-		"slow":             true,
-		"rate_limited":     true,
-		"waf_cloudflare":   true,
+		"verified_success":     false,
+		"not_wordpress":        false,
+		"done":                 false,
+		"network_error":        true,
+		"slow":                 true,
+		"rate_limited":         true,
+		"waf_cloudflare":       true,
+		"attempt_limit":        true,
+		"candidates_exhausted": false,
 	}
 	for status, want := range cases {
 		if got := retryableStatus(status); got != want {

@@ -1765,7 +1765,7 @@ func retryableStatus(status string) bool {
 	switch status {
 	case "", "done", "verified_success", "not_wordpress", "candidates_exhausted":
 		return false
-	case "cancelled", "network_error", "slow", "blocked", "rate_limited", "unavailable":
+	case "cancelled", "network_error", "slow", "blocked", "rate_limited", "unavailable", "attempt_limit":
 		return true
 	}
 	return strings.HasPrefix(status, "waf_")
