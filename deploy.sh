@@ -81,7 +81,7 @@ for WORKER in "${WORKERS[@]}"; do
             echo '' > /opt/wp-bruter/debug.log
             cd /opt/wp-bruter
             chmod +x run.sh
-            PHASES="$PHASES" \
+            PHASES=\"$PHASES\" \
             WORKERS_PER_BOX=$WORKERS_PER_BOX \
             ACTIVE_PER_BOX=$ACTIVE_PER_BOX \
             PREP_PER_BOX=$PREP_PER_BOX \

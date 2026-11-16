@@ -1026,7 +1026,9 @@ func feedAttempts(j *SiteJob) {
 				}
 				return
 			}
-			if limit >= 0 && j.queued.Load() >= limit {
+			// Count the batch that is not enqueued yet, otherwise the limit is
+			// only observed after a whole 256-item flush.
+			if limit >= 0 && j.queued.Load()+int64(len(batch))+1 > limit {
 				if len(batch) > 0 {
 					enqueueBatch(j, batch)
 				}
