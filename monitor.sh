@@ -28,6 +28,7 @@ for WORKER in "${WORKERS[@]}"; do
         echo '📊 SUMMARY:'
         echo ''
         echo -n '  progress: '; wc -l < /opt/wp-bruter/progress.txt 2>/dev/null
+        echo -n "  shard:    "; cat /root/wordpress.s* 2>/dev/null | wc -l
         echo -n '  creds:    '; wc -l < /opt/wp-bruter/creds.txt 2>/dev/null
         echo -n '  results:  '; wc -l < /opt/wp-bruter/results.txt 2>/dev/null
         echo ''

