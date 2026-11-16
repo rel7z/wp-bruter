@@ -2199,7 +2199,20 @@ func expandPasswords(passes []string, username, siteName, domainName string) []s
 // "" means clean; anything else is the skip reason.
 // quickCheck classifies a site before we spend attempts on it and returns the
 // session cookies of that very page for reuse by every login attempt.
-func quickCheck(site string) (string, string) {
+func checkTimeout() time.Duration {
+	t := *timeoutSec
+	if t > 3 {
+		t = 3 // a dead host must not cost the full request timeout
+	}
+	return time.Duration(t) * time.Second
+}
+
+type probeResult struct {
+	site, reason, cookies string
+}
+
+// probe fetches the login page once and classifies it.
+func probe(site string) probeResult {
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
@@ -2210,36 +2223,35 @@ func quickCheck(site string) (string, string) {
 	req.Header.Set("User-Agent", randomUA())
 
 	start := time.Now()
-	err := httpClient.DoTimeout(req, resp, time.Duration(*timeoutSec)*time.Second)
+	err := httpClient.DoTimeout(req, resp, checkTimeout())
 	elapsed := time.Since(start)
 	stats.requests.Add(1)
 
 	if err != nil {
-		return "network_error", ""
+		return probeResult{site, "network_error", ""}
 	}
 	if elapsed.Milliseconds() > int64(*slowThresh) {
-		return "slow", ""
+		return probeResult{site, "slow", ""}
 	}
 
 	switch resp.StatusCode() {
 	case fasthttp.StatusNotFound:
-		return "not_wordpress", ""
+		return probeResult{site, "not_wordpress", ""}
 	case fasthttp.StatusForbidden, fasthttp.StatusNotAcceptable:
-		return "blocked", ""
+		return probeResult{site, "blocked", ""}
 	case fasthttp.StatusTooManyRequests:
-		return "rate_limited", ""
+		return probeResult{site, "rate_limited", ""}
 	case fasthttp.StatusServiceUnavailable:
-		return "unavailable", ""
+		return probeResult{site, "unavailable", ""}
 	}
 
 	if *skipWaf {
 		if waf := detectWAF(resp.Body(), &resp.Header); waf != "" {
-			return "waf_" + waf, ""
+			return probeResult{site, "waf_" + waf, ""}
 		}
 	}
-
 	if !isWordPressLogin(resp.Body()) {
-		return "not_wordpress", ""
+		return probeResult{site, "not_wordpress", ""}
 	}
 
 	var cookies []string
@@ -2251,38 +2263,39 @@ func quickCheck(site string) (string, string) {
 			}
 		}
 	})
-	return "", strings.Join(cookies, "; ")
+	return probeResult{site, "", strings.Join(cookies, "; ")}
 }
 
-// quickCheckRetry runs the pre-flight check with one immediate retry for
-// transient failures, then retries the same host over the other scheme so
-// sites with broken or missing TLS are not silently checkpointed as dead.
-// It returns the URL to use and "" on success, or the original URL plus the
-// skip reason.
-func quickCheckRetry(site string) (string, string, string) {
-	reason, cookies := quickCheck(site)
-	if reason == "" {
-		return site, "", cookies
-	}
-
-	if reason == "network_error" || reason == "slow" {
-		time.Sleep(250 * time.Millisecond)
-		if reason, cookies = quickCheck(site); reason == "" {
-			return site, "", cookies
-		}
-	}
-	if reason != "network_error" && reason != "slow" {
-		return site, reason, ""
-	}
-
+// quickCheck classifies a site before we spend attempts on it and returns the
+// session cookies of that very page for reuse by every login attempt. Both
+// schemes are probed concurrently: dead hosts cost one timeout instead of
+// three sequential ones, which dominates the pre-flight on a mostly-dead list.
+func quickCheck(site string) (string, string, string) {
 	alt := swapScheme(site)
+	ch := make(chan probeResult, 2)
+	go func() { ch <- probe(site) }()
+	if alt != "" {
+		go func() { ch <- probe(alt) }()
+	}
+
+	first := <-ch
+	if first.reason == "" {
+		return first.site, "", first.cookies
+	}
 	if alt == "" {
-		return site, reason, ""
+		return site, first.reason, ""
 	}
-	if reason, cookies = quickCheck(alt); reason == "" {
-		return alt, "", cookies
+	second := <-ch
+	if second.reason == "" {
+		return second.site, "", second.cookies
 	}
-	return site, reason, ""
+	return site, first.reason, ""
+}
+
+// quickCheckRetry keeps the old name; the retry is now the concurrent scheme
+// probe inside quickCheck.
+func quickCheckRetry(site string) (string, string, string) {
+	return quickCheck(site)
 }
 
 // swapScheme flips https:// to http:// and vice versa.
