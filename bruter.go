@@ -520,7 +520,7 @@ func main() {
 	// Aggressive: use many prep workers to feed the job queue fast
 	prepWorkers := *prepWorkersF
 	if prepWorkers <= 0 {
-		prepWorkers = min(max(runtime.NumCPU()*24, 64), 256)
+		prepWorkers = min(max(runtime.NumCPU()*64, 128), 512)
 	}
 	// A prepared job owns its whole candidate slice, so this buffer is the
 	// real memory reservoir; keep it near the prep fan-out rather than huge.
