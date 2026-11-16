@@ -375,3 +375,20 @@ func TestPasswordOrderIsDeterministic(t *testing.T) {
 		t.Fatal("candidate order changed between generations")
 	}
 }
+
+// A big themed login page can carry admin markers near the top while the
+// password field sits past any 32 KB sample; it must still count as a login.
+func Test200LoginPageWithPasswordFieldBeyondSample(t *testing.T) {
+	body := strings.Repeat("filler ", 6000) + `<div id="adminmenu"></div>` +
+		strings.Repeat("filler ", 6000) + `<input name="pwd">`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+	withTimeout(t, 5)
+
+	j := &SiteJob{Site: srv.URL, quit: make(chan struct{})}
+	if outcome, _ := tryLogin(j, "admin", "wrong"); outcome != outFail {
+		t.Fatalf("login page with a pwd field must not verify, got %v", outcome)
+	}
+}

