@@ -171,7 +171,7 @@ func TestQuickCheckSchemeFallback(t *testing.T) {
 	withTimeout(t, 3)
 
 	busted := "https://" + strings.TrimPrefix(srv.URL, "http://")
-	got, reason := quickCheckRetry(busted)
+	got, reason, _ := quickCheckRetry(busted)
 	if reason != "" {
 		t.Fatalf("expected scheme fallback to succeed, got skip reason %q", reason)
 	}
@@ -272,5 +272,45 @@ func TestOutcomePrefersSuccess(t *testing.T) {
 	j.stop("network_error")
 	if got := j.outcome(); got != "verified_success" {
 		t.Fatalf("outcome = %q, want verified_success", got)
+	}
+}
+
+// One attempt must be one POST, carrying the session cookie collected during
+// the pre-flight check.
+func TestAttemptReusesSessionWithSingleRequest(t *testing.T) {
+	var mu sync.Mutex
+	var requests, posts int
+	var seenCookie string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		if r.Method == http.MethodPost {
+			posts++
+			seenCookie = r.Header.Get("Cookie")
+			http.SetCookie(w, &http.Cookie{Name: "wordpress_logged_in_x", Value: "1", Path: "/"})
+			http.Redirect(w, r, "/wp-admin/", http.StatusFound)
+			return
+		}
+		fmt.Fprint(w, `<html><form method="post"><input name="log"><input name="pwd"></form></html>`)
+	}))
+	defer srv.Close()
+	withTimeout(t, 5)
+
+	j := &SiteJob{Site: srv.URL, Cookies: "PHPSESSID=abc", quit: make(chan struct{})}
+	if outcome, _ := tryLogin(j, "admin", "x"); outcome != outSuccess {
+		t.Fatalf("want success, got %v", outcome)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if posts != 1 {
+		t.Errorf("attempt made %d POSTs, want 1", posts)
+	}
+	if requests > 2 { // one POST plus at most one verification GET
+		t.Errorf("attempt made %d requests, want <= 2", requests)
+	}
+	if !strings.Contains(seenCookie, "PHPSESSID=abc") {
+		t.Errorf("session cookie not forwarded: %q", seenCookie)
 	}
 }

