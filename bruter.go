@@ -388,7 +388,9 @@ func main() {
 					// Belongs to a deeper pass: leave it for the phase whose
 					// cap it has not reached yet, so the pre-check is not
 					// repeated for every site on every phase.
-					if *maxAttempts > 0 && e.offset >= *maxAttempts {
+					// Rows that never got attempts (dead/blocked) are pure
+					// pre-flight churn: leave them to the final pass too.
+					if *maxAttempts > 0 && (e.offset >= *maxAttempts || e.offset == 0) {
 						deferred++
 						continue
 					}
