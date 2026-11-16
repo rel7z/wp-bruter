@@ -56,6 +56,7 @@ var (
 	retryFailed  = flag.Bool("retry-failed", true, "Retry sites that previously ended in a retryable state")
 	uninstall    = flag.Bool("uninstall", false, "Stop service, remove everything, exit")
 	installFlag  = flag.Bool("install", false, "Install as systemd service and exit")
+	noInstall    = flag.Bool("no-install", false, "Run even when not the installed copy (no auto-install)")
 	diagEnabled  = flag.Bool("diag", true, "Write the diagnostic log (buffered)")
 	diagFile     = flag.String("diag-file", "", "Diagnostic log path (empty = <app dir>/debug.log)")
 	verifyTLS    = flag.Bool("verify-tls", false, "Verify TLS certificates (default off: many targets have broken chains)")
@@ -315,7 +316,7 @@ func main() {
 		defer os.Remove(pidPath)
 	}
 
-	if !isInstalledCopy() {
+	if !*noInstall && !isInstalledCopy() {
 		runInstall()
 		return
 	}
@@ -834,8 +835,15 @@ func runInstall() {
 			fmt.Fprintf(os.Stderr, "read binary: %v\n", err)
 			os.Exit(1)
 		}
-		if err := os.WriteFile(dst, src, 0o755); err != nil {
+		// Rename over the destination: a running binary cannot be truncated
+		// in place (ETXTBSY), and a rename is atomic.
+		tmp := dst + ".new"
+		if err := os.WriteFile(tmp, src, 0o755); err != nil {
 			fmt.Fprintf(os.Stderr, "write binary: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			fmt.Fprintf(os.Stderr, "replace binary: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("✓ binary → %s\n", dst)
@@ -1212,17 +1220,46 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 	return outFail, ""
 }
 
-// hasAuthCookie reports whether the response set a WordPress logged-in cookie.
-// WordPress only sets wordpress_logged_in_<hash> after real authentication.
+// hasAuthCookie reports whether the response set a *live* WordPress
+// logged-in cookie. Many hosts (SiteGround, some security plugins) also send
+// empty, already-expired wordpress_logged_in_* cookies on every failed login,
+// so the name alone is not enough: the value must be non-empty and any expiry
+// must lie in the future.
 func hasAuthCookie(resp *fasthttp.Response) bool {
 	found := false
 	resp.Header.VisitAll(func(key, value []byte) {
-		if !strings.EqualFold(string(key), "Set-Cookie") {
+		if found || !strings.EqualFold(string(key), "Set-Cookie") {
 			return
 		}
-		if strings.Contains(strings.ToLower(string(value)), "wordpress_logged_in_") {
-			found = true
+		sv := string(value)
+		eq := strings.IndexByte(sv, '=')
+		if eq < 0 || !strings.Contains(strings.ToLower(sv[:eq]), "wordpress_logged_in_") {
+			return
 		}
+		rest := sv[eq+1:]
+		val := rest
+		if i := strings.IndexByte(rest, ';'); i >= 0 {
+			val = rest[:i]
+		}
+		val = strings.TrimSpace(val)
+		if val == "" || val == "+" || strings.EqualFold(val, "deleted") {
+			return
+		}
+
+		lower := strings.ToLower(rest)
+		if i := strings.Index(lower, "max-age="); i >= 0 {
+			n, err := strconv.Atoi(strings.TrimSpace(strings.SplitN(lower[i+8:], ";", 2)[0]))
+			if err == nil && n <= 0 {
+				return
+			}
+		}
+		if i := strings.Index(lower, "expires="); i >= 0 {
+			exp := strings.TrimSpace(strings.SplitN(lower[i+8:], ";", 2)[0])
+			if t, err := fasthttp.ParseHTTPDate([]byte(exp)); err == nil && !t.After(time.Now()) {
+				return
+			}
+		}
+		found = true
 	})
 	return found
 }

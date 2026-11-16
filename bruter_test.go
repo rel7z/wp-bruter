@@ -314,3 +314,20 @@ func TestAttemptReusesSessionWithSingleRequest(t *testing.T) {
 		t.Errorf("session cookie not forwarded: %q", seenCookie)
 	}
 }
+
+// SiteGround-style failures send an empty, already-expired logged-in cookie.
+func TestHasAuthCookieIgnoresClearedCookie(t *testing.T) {
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	resp.Header.Add("Set-Cookie", "wordpress_logged_in_abc=+; expires=Sun, 16-Nov-2025 18:59:03 GMT; Max-Age=-31536000; path=/")
+	if hasAuthCookie(resp) {
+		t.Fatal("cleared/expired cookie must not count as authenticated")
+	}
+
+	resp.Reset()
+	resp.Header.Add("Set-Cookie", "wordpress_logged_in_abc=admin%7C1; path=/; HttpOnly")
+	if !hasAuthCookie(resp) {
+		t.Fatal("live cookie not detected")
+	}
+}
