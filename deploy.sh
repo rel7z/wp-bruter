@@ -30,6 +30,10 @@ for WORKER in "${WORKERS[@]}"; do
             mv -f /opt/wp-bruter/wp-bruter.new /opt/wp-bruter/wp-bruter
             mv -f /opt/wp-bruter/pass.txt.new /opt/wp-bruter/pass.txt
             pkill -9 wp-bruter 2>/dev/null || true
+            # A SIGTERM drain can take a while (in-flight 5s requests); -9 is
+            # immediate, but wait for the PID to disappear before restarting so
+            # the new instance is not refused.
+            for i in \$(seq 1 30); do pgrep -f wp-bruter >/dev/null || break; sleep 1; done
             sleep 1
             mkdir -p /opt/wp-bruter
             chmod +x /opt/wp-bruter/wp-bruter
