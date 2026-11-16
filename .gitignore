@@ -3,7 +3,23 @@ wp-bruter-linux
 wp-bruter-new
 .DS_Store
 *.exe
-bruter.go
-go.mod
-go.sum
-deploy.sh
+
+# runtime artifacts
+bruter
+progress.txt
+results.txt
+creds.txt
+debug.log
+attack.log
+clean.txt
+*.pid
+test_pass.txt
+test_sites.txt
+test_results.txt
+h1.txt
+o1.txt
+p1.txt
+pw.txt
+wordpress.txt
+rockyou.txt
+pass_wordpress.txt

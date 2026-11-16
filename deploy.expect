@@ -1,0 +1,14 @@
+#!/usr/bin/env expect
+set password "fahrel"
+set worker [lindex $argv 0]
+
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$worker "
+    mkdir -p /opt/wp-bruter /root/bruter
+    pkill -9 wp-bruter 2>/dev/null || true
+    echo 'Ready for upload'
+"
+
+expect "password:"
+send "$password\r"
+expect "Ready for upload" { puts "✅ Connected"; exit 0 }
+expect timeout { puts "❌ Timeout"; exit 1 }
