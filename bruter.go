@@ -378,18 +378,29 @@ func main() {
 			before := len(sites)
 			var remaining []string
 			retried := 0
+			deferred := 0
 			for _, s := range sites {
 				e, seen := done[s]
 				switch {
 				case !seen:
 					remaining = append(remaining, s)
 				case retryableStatus(e.status):
+					// Belongs to a deeper pass: leave it for the phase whose
+					// cap it has not reached yet, so the pre-check is not
+					// repeated for every site on every phase.
+					if *maxAttempts > 0 && e.offset >= *maxAttempts {
+						deferred++
+						continue
+					}
 					remaining = append(remaining, s)
 					retried++
 					if e.offset > 0 {
 						resumeOffsets[s] = e.offset
 					}
 				}
+			}
+			if deferred > 0 {
+				logPrintf("phase: %d sites deferred to a deeper pass\n", deferred)
 			}
 			sites = remaining
 			finished := before - len(sites)
