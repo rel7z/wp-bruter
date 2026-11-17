@@ -298,6 +298,10 @@ func TestAttemptReusesSessionWithSingleRequest(t *testing.T) {
 			http.Redirect(w, r, "/wp-admin/", http.StatusFound)
 			return
 		}
+		if r.URL.Path == "/wp-admin/" {
+			fmt.Fprint(w, `<html><body><div id="wpbody-content"></div><div id="adminmenu"></div></body></html>`)
+			return
+		}
 		fmt.Fprint(w, `<html><form method="post"><input name="log"><input name="pwd"></form></html>`)
 	}))
 	defer srv.Close()

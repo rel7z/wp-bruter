@@ -1207,10 +1207,18 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 		strings.Contains(location, "wp-admin") && !strings.Contains(location, "wp-login")
 
 	if hasAuthCookie(resp) {
-		// The cookie is authoritative; WordPress only sets it after a real
-		// authentication. No verification GET is needed.
-		diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - wordpress_logged_in cookie", user, pass))
-		return outSuccess, ""
+		// A live cookie is the strongest signal, but some plugins hand one out
+		// on a bounced session, so confirm that it opens wp-admin.
+		adminURL := location
+		if !adminRedirect {
+			adminURL = strings.TrimRight(j.Site, "/") + "/wp-admin/"
+		}
+		if verifyAdmin(j.Site, adminURL, resp) {
+			diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - wordpress_logged_in cookie", user, pass))
+			return outSuccess, ""
+		}
+		diagLog("VERIFY-FAIL", j.Site, fmt.Sprintf("%s:%s - live cookie but wp-admin bounced", user, pass))
+		return outFail, ""
 	}
 
 	// No cookie but a redirect into wp-admin: require admin content before
