@@ -13,9 +13,11 @@ echo "$IDX" > shard.idx
 # blow up with "too many open files" long before that.
 ulimit -n 262144 2>/dev/null || ulimit -n 65535 2>/dev/null
 
-# One sweep only: the phase list is walked once and the shard is done. progress.txt
-# keeps finished sites from being scanned again on the next deploy.
+# The phase list is walked SWEEPS times (default 1) and the shard is then done.
+# progress.txt keeps finished sites out of the work: they only come back if a
+# retryable status parked them.
 rm -f done
+for _sweep in $(seq 1 "${SWEEPS:-1}"); do
 for LIM in ${PHASES:-150 500 0}; do
     # Keep the logs from filling the disk across long multi-phase runs.
     [ -f attack.log ] && [ "$(stat -c%s attack.log)" -gt 104857600 ] && mv -f attack.log attack.log.1
@@ -48,6 +50,8 @@ for LIM in ${PHASES:-150 500 0}; do
         echo "phase $LIM rc=$rc — retry $tries/5"
         sleep 15
     done
+done
+sleep "${SWEEP_PAUSE:-30}"
 done
 touch done
 echo "shard $IDX finished all phases"
