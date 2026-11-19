@@ -133,6 +133,7 @@ for WORKER in "${WORKERS[@]}"; do
             sleep 1
             mkdir -p /opt/wp-bruter
             echo '' > /opt/wp-bruter/debug.log
+            rm -f /opt/wp-bruter/done
             cd /opt/wp-bruter
             chmod +x run.sh
             PHASES=\"$PHASES\" \
