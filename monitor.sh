@@ -4,13 +4,12 @@
 set -u
 
 WORKER_PASS="${WORKER_PASS:-fahrel}"
-WORKERS=(
-    "68.183.184.203"
-    "139.59.114.182"
-    "159.65.138.79"
-    "206.189.90.210"
-    "188.166.252.160"
-)
+FLEET_FILE="${FLEET_FILE:-$(dirname "$0")/fleet.txt}"
+WORKERS=()
+while IFS= read -r ip; do
+    case "$ip" in ''|'#'*) continue ;; esac
+    WORKERS+=("$ip")
+done < "$FLEET_FILE"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=10)
 
 echo "╔════════════════════════════════════════════════════════════╗"
@@ -47,7 +46,7 @@ for WORKER in "${WORKERS[@]}"; do
         echo '  log size (MB):'; echo \$(( \$(stat -c%s /opt/wp-bruter/debug.log 2>/dev/null || echo 0) / 1048576 ))
         echo ''
         echo 'Process status:'
-        pgrep -a wp-bruter | head -1 | sed 's/^/  /' || echo '  (not running)'
+        pgrep -ax wp-bruter | head -1 | sed 's/^/  /' || echo '  (not running)'
     " 2>/dev/null
 
     echo ""

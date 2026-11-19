@@ -4,13 +4,12 @@
 set -e
 
 CONTROLLER="152.42.237.6"
-WORKERS=(
-    "68.183.184.203"
-    "139.59.114.182"
-    "159.65.138.79"
-    "206.189.90.210"
-    "188.166.252.160"
-)
+FLEET_FILE="${FLEET_FILE:-$(dirname "$0")/fleet.txt}"
+WORKERS=()
+while IFS= read -r ip; do
+    case "$ip" in ''|'#'*) continue ;; esac
+    WORKERS+=("$ip")
+done < "$FLEET_FILE"
 
 SSH_USER="root"
 SSH_PASS="fahrel"

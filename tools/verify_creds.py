@@ -51,13 +51,27 @@ import ssl
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 
-FLEET = [
-    "68.183.184.203",
-    "139.59.114.182",
-    "159.65.138.79",
-    "206.189.90.210",
-    "188.166.252.160",
-]
+FLEET_FILE = os.environ.get(
+    "FLEET_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fleet.txt")
+)
+
+
+def load_fleet() -> list[str]:
+    """Fleet hosts: FLEET env (space/comma separated) wins, else fleet.txt."""
+    raw = os.environ.get("FLEET", "")
+    if raw.strip():
+        hosts = [h.strip() for h in raw.replace(",", " ").split()]
+    else:
+        try:
+            with open(FLEET_FILE, encoding="utf-8") as fh:
+                hosts = [ln.split("#", 1)[0].strip() for ln in fh]
+        except FileNotFoundError:
+            print(f"warning: fleet file not found: {FLEET_FILE}", file=sys.stderr)
+            hosts = []
+    return [h for h in hosts if h]
+
+
+FLEET = load_fleet()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
 TEST_COOKIE = "wordpress_test_cookie=WP+Cookie+check"
 
