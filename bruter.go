@@ -64,6 +64,8 @@ var (
 	verifyTLS    = flag.Bool("verify-tls", false, "Verify TLS certificates (default off: many targets have broken chains)")
 	prepWorkersF = flag.Int("prep-workers", 0, "Pre-flight workers (0 = auto from CPU)")
 	prepTimeout  = flag.Int("prep-timeout", 0, "Pre-flight request timeout in seconds (0 = same as -timeout)")
+	attemptBatch = flag.Int("attempt-batch", 32, "Attempts a single site may queue at once (spreads workers across hosts)")
+	netErrorCap  = flag.Int("net-error-cap", 5, "Consecutive network errors before a site is parked")
 )
 
 var logOutput *os.File
@@ -1018,7 +1020,7 @@ func prepareJob(site string) *SiteJob {
 
 func feedAttempts(j *SiteJob) {
 	defer j.fed.Store(true)
-	batch := make([]*Attempt, 0, 256) // batch size
+	batch := make([]*Attempt, 0, batchSize()) // batch size
 
 	// A job resumed by a later breadth pass starts at Offset; the attempt cap
 	// is absolute, so only the remaining budget is fed.
@@ -1042,7 +1044,7 @@ func feedAttempts(j *SiteJob) {
 				return
 			}
 			// Count the batch that is not enqueued yet, otherwise the limit is
-			// only observed after a whole 256-item flush.
+			// only observed after a whole batch flush.
 			if limit >= 0 && j.queued.Load()+int64(len(batch))+1 > limit {
 				if len(batch) > 0 {
 					enqueueBatch(j, batch)
@@ -1054,7 +1056,7 @@ func feedAttempts(j *SiteJob) {
 			batch = append(batch, &Attempt{Job: j, User: u, Pass: p})
 
 			// Flush batch when full
-			if len(batch) >= 256 {
+			if len(batch) >= batchSize() {
 				if !enqueueBatch(j, batch) {
 					return // site stopped
 				}
@@ -1067,6 +1069,16 @@ func feedAttempts(j *SiteJob) {
 	if len(batch) > 0 {
 		enqueueBatch(j, batch)
 	}
+}
+
+// batchSize is how many attempts one site may enqueue at once. Workers pop
+// FIFO, so a 256 batch lets the pool pile ~256 requests onto a single host;
+// a small batch spreads the same workers over dozens of hosts.
+func batchSize() int {
+	if *attemptBatch > 0 {
+		return *attemptBatch
+	}
+	return 32
 }
 
 func enqueueBatch(j *SiteJob, batch []*Attempt) bool {
@@ -1114,7 +1126,7 @@ func processAttempt(a *Attempt) {
 			j.stop(detail)
 		}
 	case outNetErr:
-		if j.consecErrs.Add(1) >= 3 {
+		if j.consecErrs.Add(1) >= int32(*netErrorCap) {
 			j.stop("network_error")
 		}
 	case outFail:
@@ -2677,7 +2689,7 @@ func displayProgress(total int) {
 // ============================================================================
 
 func newHTTPClient() *fasthttp.Client {
-	connsPerHost := max(*maxWorkers/max(*maxActive, 1)*2, 64)
+	connsPerHost := max(*maxWorkers/max(*maxActive, 1)*2, batchSize()*2, 64)
 	c := &fasthttp.Client{
 		ReadTimeout:                   time.Duration(*timeoutSec) * time.Second,
 		WriteTimeout:                  time.Duration(*timeoutSec) * time.Second,

