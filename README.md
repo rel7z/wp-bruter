@@ -12,6 +12,26 @@ Shard index is tied to the line position, not to how many hosts answer: a dead
 host keeps its shard and the next deploy resumes it. A host that does not answer
 is skipped, the rest still deploy.
 
+## XML-RPC
+
+Every prepared site is probed once with `system.listMethods`. If it answers and
+`system.multicall` is present, the whole candidate list for that site is sent
+`-xmlrpc-batch` credentials (default 50) per POST to `/xmlrpc.php`, which turns
+a per-password request count into one request per 50. A hit is always confirmed
+with a real `/wp-login.php` POST before it is written, because plugins exist
+that make XML-RPC authenticate any password.
+
+Any protocol problem (endpoint off, redirect to a custom login page, unparsable
+body, method missing) switches that site to `/wp-login.php` permanently for the
+run. `-xmlrpc=false` disables the path entirely.
+
+## WAF targets
+
+`-skip-waf` is off by default: a Cloudflare/Wordfence/Sucuri signature or a 403
+challenge no longer discards the site, it is attacked anyway. A job is only
+given up when it turns slow (`-slow-threshold`) or blocks twice in a row.
+`-skip-waf` restores the old drop-on-sight behaviour.
+
 ## Run a list
 
 ```
@@ -143,6 +163,7 @@ beside the input and can push the verified file back to the fleet.
 | `PREP_PER_BOX` | 512 | pre-flight workers |
 | `TIMEOUT` | 5 | request timeout, seconds |
 | `PHASES` | `150 500 0` | attempts per pass |
+| `-xmlrpc-batch` | 50 | passwords per multicall (run.sh, add manually) |
 | `LOCAL_SITES` | `wordpress.txt` | list to deploy |
 | `LOCAL_PASS` | `pass.txt` | password list |
 | `SWEEP_PAUSE` | — | unused, one sweep is the default |
@@ -157,8 +178,9 @@ panic).
 
 ## Known noise
 
-- A 403 host is recorded `blocked`/`waf_cloudflare`; `-skip-waf` defaults to
-  true so it is skipped on purpose.
+- A 403 host is still attacked (a challenge page rarely exposes the form); the
+  block counter ends it after two refusals. `-skip-waf` drops such sites in
+  pre-flight instead.
 - `network_error` is usually a transient DNS/TLS failure, not a dead site.
   The resolver drops packets during 8000-way bursts; retry the site or lower
   concurrency.

