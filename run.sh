@@ -17,8 +17,9 @@ ulimit -n 262144 2>/dev/null || ulimit -n 65535 2>/dev/null
 # keeps finished sites from being scanned again on the next deploy.
 rm -f done
 for LIM in ${PHASES:-150 500 0}; do
-    # Keep the log from filling the disk across long multi-phase runs.
+    # Keep the logs from filling the disk across long multi-phase runs.
     [ -f attack.log ] && [ "$(stat -c%s attack.log)" -gt 104857600 ] && mv -f attack.log attack.log.1
+    [ -f debug.log ] && [ "$(stat -c%s debug.log)" -gt 262144000 ] && mv -f debug.log debug.log.1
     tries=0
     while :; do
         ./wp-bruter \
