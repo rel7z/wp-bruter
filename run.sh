@@ -7,6 +7,7 @@
 set -u
 IDX="${1:?shard index}"
 cd /opt/wp-bruter || exit 1
+echo "$IDX" > shard.idx
 
 # 8000 active sites keep ~2 sockets each; the default soft limit (1024) would
 # blow up with "too many open files" long before that.
