@@ -51,8 +51,10 @@ shard content changes), removes shard files from an old fleet size and starts
 
 ## Shard lifecycle
 
-`run.sh` walks the phase list once — `150` then `500` then `0` attempts — and
-then touches `/opt/wp-bruter/done` and exits. It does not repeat on its own.
+`run.sh` walks the phase list `SWEEPS` times (default `1`) — each sweep is
+`150` then `500` then `0` attempts — and then touches `/opt/wp-bruter/done` and
+exits. It does not repeat on its own. Raise it with `SWEEPS=3 ./deploy.sh` when
+the list still has parked sites worth retrying.
 
 `progress.txt` is the resume ledger: rows that finished for good
 (`verified_success`, `not_wordpress`, `candidates_exhausted`) are skipped on the
