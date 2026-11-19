@@ -10,9 +10,9 @@
 set -u
 
 WORKER_PASS="${WORKER_PASS:-fahrel}"
-WORKERS_PER_BOX="${WORKERS_PER_BOX:-4000}"
-ACTIVE_PER_BOX="${ACTIVE_PER_BOX:-8000}"
-PREP_PER_BOX="${PREP_PER_BOX:-512}"
+WORKERS_PER_BOX="${WORKERS_PER_BOX:-3000}"
+ACTIVE_PER_BOX="${ACTIVE_PER_BOX:-2500}"
+PREP_PER_BOX="${PREP_PER_BOX:-768}"
 PHASES="${PHASES:-150 500 0}"
 SITES_FILE="${SITES_FILE:-/root/wordpress.txt}"
 LOCAL_SITES="${LOCAL_SITES:-wordpress.txt}"
@@ -24,7 +24,7 @@ while IFS= read -r ip; do
 done < "$FLEET_FILE"
 [ ${#WORKERS[@]} -gt 0 ] || { echo "empty fleet: $FLEET_FILE" >&2; exit 1; }
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=10)
+SSH_OPTS=(-o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=6 -o IPQoS=throughput)
 ssh_cmd() { sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$1" "${@:2}"; }
 scp_cmd() { sshpass -p "$WORKER_PASS" scp -O "${SSH_OPTS[@]}" "$1" "root@$2:$3"; }
 
