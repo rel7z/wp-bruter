@@ -4,7 +4,7 @@
 set -u
 
 WORKER_PASS="${WORKER_PASS:-fahrel}"
-FLEET_FILE="${FLEET_FILE:-$(dirname "$0")/fleet.txt}"
+FLEET_FILE="${FLEET_FILE:-$(cd "$(dirname "$0")" && pwd)/fleet.txt}"
 WORKERS=()
 while IFS= read -r ip; do
     case "$ip" in ''|'#'*) continue ;; esac
