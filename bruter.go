@@ -63,9 +63,6 @@ var (
 	diagFile     = flag.String("diag-file", "", "Diagnostic log path (empty = <app dir>/debug.log)")
 	verifyTLS    = flag.Bool("verify-tls", false, "Verify TLS certificates (default off: many targets have broken chains)")
 	prepWorkersF = flag.Int("prep-workers", 0, "Pre-flight workers (0 = auto from CPU)")
-	prepTimeout  = flag.Int("prep-timeout", 0, "Pre-flight request timeout in seconds (0 = same as -timeout)")
-	attemptBatch = flag.Int("attempt-batch", 32, "Attempts a single site may queue at once (spreads workers across hosts)")
-	netErrorCap  = flag.Int("net-error-cap", 5, "Consecutive network errors before a site is parked")
 )
 
 var logOutput *os.File
@@ -1020,7 +1017,7 @@ func prepareJob(site string) *SiteJob {
 
 func feedAttempts(j *SiteJob) {
 	defer j.fed.Store(true)
-	batch := make([]*Attempt, 0, batchSize()) // batch size
+	batch := make([]*Attempt, 0, 256) // batch size
 
 	// A job resumed by a later breadth pass starts at Offset; the attempt cap
 	// is absolute, so only the remaining budget is fed.
@@ -1044,7 +1041,7 @@ func feedAttempts(j *SiteJob) {
 				return
 			}
 			// Count the batch that is not enqueued yet, otherwise the limit is
-			// only observed after a whole batch flush.
+			// only observed after a whole 256-item flush.
 			if limit >= 0 && j.queued.Load()+int64(len(batch))+1 > limit {
 				if len(batch) > 0 {
 					enqueueBatch(j, batch)
@@ -1056,7 +1053,7 @@ func feedAttempts(j *SiteJob) {
 			batch = append(batch, &Attempt{Job: j, User: u, Pass: p})
 
 			// Flush batch when full
-			if len(batch) >= batchSize() {
+			if len(batch) >= 256 {
 				if !enqueueBatch(j, batch) {
 					return // site stopped
 				}
@@ -1069,16 +1066,6 @@ func feedAttempts(j *SiteJob) {
 	if len(batch) > 0 {
 		enqueueBatch(j, batch)
 	}
-}
-
-// batchSize is how many attempts one site may enqueue at once. Workers pop
-// FIFO, so a 256 batch lets the pool pile ~256 requests onto a single host;
-// a small batch spreads the same workers over dozens of hosts.
-func batchSize() int {
-	if *attemptBatch > 0 {
-		return *attemptBatch
-	}
-	return 32
 }
 
 func enqueueBatch(j *SiteJob, batch []*Attempt) bool {
@@ -1126,7 +1113,7 @@ func processAttempt(a *Attempt) {
 			j.stop(detail)
 		}
 	case outNetErr:
-		if j.consecErrs.Add(1) >= int32(*netErrorCap) {
+		if j.consecErrs.Add(1) >= 3 {
 			j.stop("network_error")
 		}
 	case outFail:
@@ -1987,9 +1974,6 @@ func cachedDial(addr string) (net.Conn, error) {
 		if i > 0 {
 			timeout = 3 * time.Second
 		}
-		if d := checkTimeout(); d < timeout {
-			timeout = d
-		}
 		conn, dialErr := fasthttp.DialTimeout(ip+":"+port, timeout)
 		if dialErr == nil {
 			dnsLookupCache.Store(host, &dnsCacheEntry{
@@ -2229,11 +2213,9 @@ func expandPasswords(passes []string, username, siteName, domainName string) []s
 // quickCheck classifies a site before we spend attempts on it and returns the
 // session cookies of that very page for reuse by every login attempt.
 func checkTimeout() time.Duration {
-	// Pre-flight runs far more often than a login attempt, so it gets its own
-	// knob. The old hard 3s cap marked every slow-but-live host as dead.
-	t := *prepTimeout
-	if t <= 0 {
-		t = *timeoutSec
+	t := *timeoutSec
+	if t > 3 {
+		t = 3 // a dead host must not cost the full request timeout
 	}
 	return time.Duration(t) * time.Second
 }
@@ -2689,16 +2671,13 @@ func displayProgress(total int) {
 // ============================================================================
 
 func newHTTPClient() *fasthttp.Client {
-	// HostClient conns are per target host: a site can legitimately have
-	// www/http/https variants in flight at once. 64 exhausted easily and every
-	// extra request sat in the wait queue until it timed out.
-	connsPerHost := max(*maxWorkers/max(*maxActive, 1)*2, batchSize()*4, 256)
+	connsPerHost := max(*maxWorkers/max(*maxActive, 1)*2, 64)
 	c := &fasthttp.Client{
 		ReadTimeout:                   time.Duration(*timeoutSec) * time.Second,
 		WriteTimeout:                  time.Duration(*timeoutSec) * time.Second,
 		MaxConnsPerHost:               connsPerHost,
 		MaxIdleConnDuration:           60 * time.Second,
-		MaxConnWaitTimeout:            time.Duration(*timeoutSec) * time.Second,
+		MaxConnWaitTimeout:            10 * time.Second,
 		MaxResponseBodySize:           2 << 20,
 		NoDefaultUserAgentHeader:      true,
 		DisableHeaderNamesNormalizing: true,
