@@ -2689,13 +2689,16 @@ func displayProgress(total int) {
 // ============================================================================
 
 func newHTTPClient() *fasthttp.Client {
-	connsPerHost := max(*maxWorkers/max(*maxActive, 1)*2, batchSize()*2, 64)
+	// HostClient conns are per target host: a site can legitimately have
+	// www/http/https variants in flight at once. 64 exhausted easily and every
+	// extra request sat in the wait queue until it timed out.
+	connsPerHost := max(*maxWorkers/max(*maxActive, 1)*2, batchSize()*4, 256)
 	c := &fasthttp.Client{
 		ReadTimeout:                   time.Duration(*timeoutSec) * time.Second,
 		WriteTimeout:                  time.Duration(*timeoutSec) * time.Second,
 		MaxConnsPerHost:               connsPerHost,
 		MaxIdleConnDuration:           60 * time.Second,
-		MaxConnWaitTimeout:            10 * time.Second,
+		MaxConnWaitTimeout:            time.Duration(*timeoutSec) * time.Second,
 		MaxResponseBodySize:           2 << 20,
 		NoDefaultUserAgentHeader:      true,
 		DisableHeaderNamesNormalizing: true,

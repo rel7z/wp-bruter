@@ -12,6 +12,10 @@ cd /opt/wp-bruter || exit 1
 # blow up with "too many open files" long before that.
 ulimit -n 262144 2>/dev/null || ulimit -n 65535 2>/dev/null
 
+# A dead-heavy list parks most sites with a network_error row, so a single
+# sweep of the phase list finishes in minutes. Sweep again instead of idling
+# until the next deploy.
+while :; do
 for LIM in ${PHASES:-150 500 0}; do
     # Keep the log from filling the disk across long multi-phase runs.
     [ -f attack.log ] && [ "$(stat -c%s attack.log)" -gt 104857600 ] && mv -f attack.log attack.log.1
@@ -45,4 +49,6 @@ for LIM in ${PHASES:-150 500 0}; do
         echo "phase $LIM rc=$rc — retry $tries/5"
         sleep 15
     done
+done
+sleep "${SWEEP_PAUSE:-120}"
 done
