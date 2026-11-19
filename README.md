@@ -1,6 +1,6 @@
 # wp-bruter fleet
 
-Tools: `spread.sh`, `deploy.sh`, `farm.sh`, `watchdog.sh`, `monitor.sh`,
+Tools: `spread.sh`, `deploy.sh`, `farm.sh`, `watchdog.sh`, `stop.sh`, `monitor.sh`,
 `tools/verify_creds.py`.
 
 ## Fleet
@@ -103,9 +103,13 @@ absent **and** `done` is missing:
 
 ## Stop
 
-Watchdog revives within three minutes, so kill the cron first:
-
 ```
+./stop.sh            # graceful: removes watchdog cron, SIGTERM -> wait 5s -> SIGKILL
+./stop.sh --force    # immediate SIGKILL (-9)
+```
+
+Manual alternative:
+```bash
 # 1. remove the watchdog everywhere
 for ip in $(cat fleet.txt); do
   sshpass -p fahrel ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no root@$ip 'rm -f /etc/cron.d/wp-bruter'
