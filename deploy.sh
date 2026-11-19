@@ -137,6 +137,7 @@ for WORKER in "${WORKERS[@]}"; do
             cd /opt/wp-bruter
             chmod +x run.sh
             PHASES=\"$PHASES\" \
+            SWEEPS=${SWEEPS:-1} \
             WORKERS_PER_BOX=$WORKERS_PER_BOX \
             ACTIVE_PER_BOX=$ACTIVE_PER_BOX \
             PREP_PER_BOX=$PREP_PER_BOX \
