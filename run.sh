@@ -26,6 +26,7 @@ for LIM in ${PHASES:-150 500 0}; do
             -prep-workers "${PREP_PER_BOX:-768}" \
             -max-attempts "$LIM" \
             -timeout "${TIMEOUT:-12}" \
+            -prep-timeout "${PREP_TIMEOUT:-10}" \
             -verbose >> attack.log 2>&1
         rc=$?
         # Wait for this phase's process to disappear before the next one starts,

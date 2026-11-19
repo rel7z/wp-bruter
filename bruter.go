@@ -63,6 +63,7 @@ var (
 	diagFile     = flag.String("diag-file", "", "Diagnostic log path (empty = <app dir>/debug.log)")
 	verifyTLS    = flag.Bool("verify-tls", false, "Verify TLS certificates (default off: many targets have broken chains)")
 	prepWorkersF = flag.Int("prep-workers", 0, "Pre-flight workers (0 = auto from CPU)")
+	prepTimeout  = flag.Int("prep-timeout", 0, "Pre-flight request timeout in seconds (0 = same as -timeout)")
 )
 
 var logOutput *os.File
@@ -1974,6 +1975,9 @@ func cachedDial(addr string) (net.Conn, error) {
 		if i > 0 {
 			timeout = 3 * time.Second
 		}
+		if d := checkTimeout(); d < timeout {
+			timeout = d
+		}
 		conn, dialErr := fasthttp.DialTimeout(ip+":"+port, timeout)
 		if dialErr == nil {
 			dnsLookupCache.Store(host, &dnsCacheEntry{
@@ -2213,9 +2217,11 @@ func expandPasswords(passes []string, username, siteName, domainName string) []s
 // quickCheck classifies a site before we spend attempts on it and returns the
 // session cookies of that very page for reuse by every login attempt.
 func checkTimeout() time.Duration {
-	t := *timeoutSec
-	if t > 3 {
-		t = 3 // a dead host must not cost the full request timeout
+	// Pre-flight runs far more often than a login attempt, so it gets its own
+	// knob. The old hard 3s cap marked every slow-but-live host as dead.
+	t := *prepTimeout
+	if t <= 0 {
+		t = *timeoutSec
 	}
 	return time.Duration(t) * time.Second
 }
