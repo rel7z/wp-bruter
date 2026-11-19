@@ -28,11 +28,13 @@ echo "║  STOPPING WP-BRUTER FLEET & WATCHDOG                       ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo "[*] Fleet file: $FLEET_FILE"
 echo "[*] Mode: $( [ $FORCE -eq 1 ] && echo 'FORCE (SIGKILL -9)' || echo 'GRACEFUL (SIGTERM -> 5s -> SIGKILL)' )"
+echo "[*] Stopping all workers in parallel..."
 echo ""
 
-for WORKER in $(grep -Ev '^[[:space:]]*(#|$)' "$FLEET_FILE"); do
-    printf "[%s] " "$WORKER"
-    out=$(sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$WORKER" "
+stop_worker() {
+    local host="$1"
+    local res
+    res=$(sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$host" "
         # 1. Remove watchdog cron first
         rm -f /etc/cron.d/wp-bruter
 
@@ -56,9 +58,19 @@ for WORKER in $(grep -Ev '^[[:space:]]*(#|$)' "$FLEET_FILE"); do
         else
             echo \"WARNING: \$cnt process(es) still alive\"
         fi
-    " 2>/dev/null) || { echo "ssh connection failed"; continue; }
-    echo "$out"
+    " 2>&1)
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        printf "[%-16s] %s\n" "$host" "$res"
+    else
+        printf "[%-16s] SSH FAILED (timeout/auth error)\n" "$host"
+    fi
+}
+
+for WORKER in $(grep -Ev '^[[:space:]]*(#|$)' "$FLEET_FILE"); do
+    stop_worker "$WORKER" &
 done
+wait
 
 echo ""
 echo "[*] Fleet shutdown routine complete."
