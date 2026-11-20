@@ -32,7 +32,25 @@ challenge no longer discards the site, it is attacked anyway. A job is only
 given up when it turns slow (`-slow-threshold`) or blocks twice in a row.
 `-skip-waf` restores the old drop-on-sight behaviour.
 
-## Run a list
+## Just run the binary
+
+On a box that already has `wordpress.txt` from the CNC, nothing else is needed:
+
+```
+./wp-bruter
+```
+
+It installs itself to `/opt/wp-bruter`, raises the fd limit, then walks the
+attempt phases `150 -> 500 -> 0` and repeats a sweep while progress still grows.
+A phase that dies is retried up to 5 times. `progress.txt` decides what is left,
+so Ctrl-C and a rerun resume where it stopped.
+
+Flags worth knowing: `-sweeps N` (default 1, stops early when progress stalls),
+`-phase-list 150,500,0`, `-sites /root/wordpress.txt`, `-timeout 5`.
+
+More than one box? Split with the CNC, or hand each box its own `-sites` file.
+
+## Run a list (scripted)
 
 ```
 ./spread.sh <drive-link-or-id>          # download, cache, shard, deploy
