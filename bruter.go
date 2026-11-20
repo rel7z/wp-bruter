@@ -65,13 +65,14 @@ var (
 	prepWorkersF = flag.Int("prep-workers", 0, "Pre-flight workers (0 = auto from CPU)")
 	autoRun      = flag.Bool("auto", false, "Walk every phase and sweep automatically (default for a bare ./wp-bruter)")
 	sweeps       = flag.Int("sweeps", 1, "Sweeps in auto mode; stops early once progress stalls")
-	phaseList    = flag.String("phase-list", "150,500,0", "Attempt caps per phase in auto mode")
-	useXMLRPC    = flag.Bool("xmlrpc", true, "Use /xmlrpc.php system.multicall, fall back to /wp-login.php per site")
+	phaseList    = flag.String("phase-list", "300,800,0", "Attempt caps per phase in auto mode")
+	useXMLRPC    = flag.Bool("xmlrpc", false, "Use /xmlrpc.php system.multicall, fall back to /wp-login.php per site")
 	xmlrpcBatch  = flag.Int("xmlrpc-batch", 50, "Passwords per XML-RPC multicall request")
 )
 
 var logOutput *os.File
 var debugLog *os.File
+var diagPath string
 
 // diagLog is buffered: every worker shares one file descriptor, and an fsync
 // per line serialized the whole pool on internal/poll's FD mutex. Lines go to
@@ -110,11 +111,23 @@ func diagWriter() {
 	buf := make([]byte, 0, 64<<10)
 	t := time.NewTicker(200 * time.Millisecond)
 	defer t.Stop()
+	var written int64
 	flush := func() {
 		if len(buf) > 0 && debugLog != nil {
-			debugLog.Write(buf)
+			n, _ := debugLog.Write(buf)
+			written += int64(n)
 			debugLog.Sync()
 			buf = buf[:0]
+		}
+		if written > 128<<20 && debugLog != nil {
+			// Size rotation at runtime: the per-open check alone let a single
+			// long phase write 10 GB.
+			debugLog.Close()
+			os.Rename(diagPath, diagPath+".1")
+			if f, err := os.OpenFile(diagPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+				debugLog = f
+				written = 0
+			}
 		}
 		if n := diagDrop.Swap(0); n > 0 && debugLog != nil {
 			fmt.Fprintf(debugLog, "[%s] [DIAG] dropped %d lines (buffer full)\n",
@@ -492,7 +505,7 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: cannot open %s: %v\n", crackedPath, err)
 	}
-	diagPath := *diagFile
+	diagPath = *diagFile
 	if diagPath == "" {
 		diagPath = filepath.Join(appDir(), "debug.log")
 	}
