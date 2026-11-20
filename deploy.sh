@@ -5,7 +5,7 @@
 # brute-forced once across the fleet instead of once per worker. Each worker
 # keeps its own progress file (resume still works across redeploys).
 #
-# Workers only accept password auth; set WORKER_PASS to override.
+# Auth: SSH_KEY=~/.ssh/id_ed25519 for key auth, otherwise WORKER_PASS.
 # Tuning knobs are env vars: WORKERS_PER_BOX, ACTIVE_PER_BOX, PREP_PER_BOX.
 set -u
 
@@ -28,25 +28,7 @@ while IFS= read -r ip; do
 done < "$FLEET_FILE"
 [ ${#WORKERS[@]} -gt 0 ] || { echo "empty fleet: $FLEET_FILE" >&2; exit 1; }
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=6 -o IPQoS=throughput -o NumberOfPasswordPrompts=1 -o ControlMaster=auto -o ControlPath="/tmp/wpbruter-%r@%h:%p" -o ControlPersist=120)
-# sshd throttles bursts of password auth from one IP; one muxed connection per
-# host plus retries keeps a loaded box from locking the deploy out.
-ssh_cmd() {
-    local host="$1" try
-    for try in 1 2 3; do
-        sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$host" "${@:2}" && return 0
-        sleep 2
-    done
-    return 1
-}
-scp_cmd() {
-    local try
-    for try in 1 2 3; do
-        sshpass -p "$WORKER_PASS" scp -O "${SSH_OPTS[@]}" "$1" "root@$2:$3" && return 0
-        sleep 2
-    done
-    return 1
-}
+. "$HERE/ssh_common.sh"
 
 N=${#WORKERS[@]}
 SHARD_DIR=$(mktemp -d)

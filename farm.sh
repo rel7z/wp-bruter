@@ -15,22 +15,13 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 FLEET_FILE="${FLEET_FILE:-$HERE/fleet.txt}"
-WORKER_PASS="${WORKER_PASS:-fahrel}"
 MIN_LIVE="${MIN_LIVE:-200}"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=15 -o ServerAliveInterval=5 -o IPQoS=throughput -o NumberOfPasswordPrompts=1 -o ControlMaster=auto -o ControlPath="/tmp/wpbruter-%r@%h:%p" -o ControlPersist=120)
-ssh_cmd() {
-    local host="$1" try
-    for try in 1 2 3; do
-        sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$host" "${@:2}" && return 0
-        sleep 2
-    done
-    return 1
-}
+. "$HERE/ssh_common.sh"
 
-for WORKER in $(grep -Ev '^[[:space:]]*(#|$)' "$FLEET_FILE"); do
+for WORKER in $(fleet_hosts); do
     printf '[%s] ' "$WORKER"
     out=$(ssh_cmd "$WORKER" "
         cd /opt/wp-bruter || exit 1

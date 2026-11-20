@@ -9,10 +9,9 @@
 #   ./stop.sh            # graceful stop (SIGTERM then SIGKILL if needed)
 #   ./stop.sh --force    # immediate SIGKILL (-9)
 set -u
-
 HERE=$(cd "$(dirname "$0")" && pwd)
 FLEET_FILE="${FLEET_FILE:-$HERE/fleet.txt}"
-WORKER_PASS="${WORKER_PASS:-fahrel}"
+. "$HERE/ssh_common.sh"
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
 
@@ -20,8 +19,6 @@ if [ ! -f "$FLEET_FILE" ]; then
     echo "[-] Fleet file not found: $FLEET_FILE" >&2
     exit 1
 fi
-
-SSH_OPTS=(-o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=10 -o NumberOfPasswordPrompts=1 -o ControlMaster=auto -o ControlPath="/tmp/wpbruter-%r@%h:%p" -o ControlPersist=60)
 
 echo "╔════════════════════════════════════════════════════════════╗"
 echo "║  STOPPING WP-BRUTER FLEET & WATCHDOG                       ║"
@@ -34,7 +31,7 @@ echo ""
 stop_worker() {
     local host="$1"
     local res
-    res=$(sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$host" "
+    res=$(ssh_cmd "$host" "
         # 1. Remove watchdog cron first
         rm -f /etc/cron.d/wp-bruter
 
@@ -67,7 +64,7 @@ stop_worker() {
     fi
 }
 
-for WORKER in $(grep -Ev '^[[:space:]]*(#|$)' "$FLEET_FILE"); do
+for WORKER in $(fleet_hosts); do
     stop_worker "$WORKER" &
 done
 wait

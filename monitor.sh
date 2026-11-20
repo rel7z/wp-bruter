@@ -1,17 +1,14 @@
 #!/bin/bash
 # Monitor the worker fleet's diagnostic log and results.
-# Workers only accept password auth; set WORKER_PASS to override.
 set -u
-
-WORKER_PASS="${WORKER_PASS:-fahrel}"
-FLEET_FILE="${FLEET_FILE:-$(cd "$(dirname "$0")" && pwd)/fleet.txt}"
+HERE=$(cd "$(dirname "$0")" && pwd)
+FLEET_FILE="${FLEET_FILE:-$HERE/fleet.txt}"
+. "$HERE/ssh_common.sh"
 WORKERS=()
 while IFS= read -r ip; do
     case "$ip" in ''|'#'*) continue ;; esac
     WORKERS+=("$ip")
 done < "$FLEET_FILE"
-SSH_OPTS=(-o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=10)
-
 echo "╔════════════════════════════════════════════════════════════╗"
 echo "║  WORDPRESS BRUTER - DIAGNOSTIC MONITOR                     ║"
 echo "╚════════════════════════════════════════════════════════════╝"
@@ -23,7 +20,7 @@ for WORKER in "${WORKERS[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    sshpass -p "$WORKER_PASS" ssh "${SSH_OPTS[@]}" "root@$WORKER" "
+    ssh_cmd "$WORKER" "
         echo '📊 SUMMARY:'
         echo ''
         echo -n '  progress: '; wc -l < /opt/wp-bruter/progress.txt 2>/dev/null
