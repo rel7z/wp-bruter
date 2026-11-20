@@ -50,6 +50,9 @@ func wantsSupervisor(args []string) bool {
 // installSelf writes a copy beside the running one and renames it into place,
 // because a running binary cannot be overwritten (ETXTBSY).
 func installSelf(self, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(self)
 	if err != nil {
 		return err
@@ -91,6 +94,16 @@ func childArgs(sites string) []string {
 func runSupervised() {
 	raiseFDLimit()
 
+	sites, err := resolveList()
+	if err != nil {
+		logPrintf("%v\n", err)
+		os.Exit(1)
+	}
+	if sites, err = filepath.Abs(sites); err != nil {
+		logPrintf("cannot resolve list path: %v\n", err)
+		os.Exit(1)
+	}
+
 	self := mustExe()
 	if !isInstalledCopy() {
 		dst := filepath.Join(installDir, "wp-bruter")
@@ -110,11 +123,6 @@ func runSupervised() {
 		}
 	}
 
-	sites, err := resolveList()
-	if err != nil {
-		logPrintf("%v\n", err)
-		os.Exit(1)
-	}
 	logPrintf("list: %s\n", sites)
 	phases := parsePhases(*phaseList)
 	started := time.Now()
