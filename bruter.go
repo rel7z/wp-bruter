@@ -835,6 +835,7 @@ Type=simple
 WorkingDirectory=/opt/wp-bruter
 EnvironmentFile=-/opt/wp-bruter/config.env
 ExecStart=/opt/wp-bruter/wp-bruter \
+    -auto \
     -sites ${SITES_FILE} \
     -passlist ${PASS_FILE} \
     -output ${OUTPUT_FILE} \
