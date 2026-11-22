@@ -12,6 +12,13 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE" || exit 1
 
+# Workers are linux/amd64. A local `go build` produces a macOS binary that dies
+# with "Exec format error" on every box, so refuse to ship one.
+if ! file wp-bruter 2>/dev/null | grep -q 'ELF'; then
+    echo "not a linux binary — building with ./build.sh"
+    ./build.sh || exit 1
+fi
+
 WORKER_PASS="${WORKER_PASS:-fahrel}"
 WORKERS_PER_BOX="${WORKERS_PER_BOX:-4000}"
 ACTIVE_PER_BOX="${ACTIVE_PER_BOX:-8000}"
