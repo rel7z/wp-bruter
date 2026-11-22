@@ -237,6 +237,14 @@ def verify(cred: Cred, timeout: float) -> str:
     if code in (403, 404, 429, 500, 502, 503, 504):
         return "UNKNOWN" if code in (429, 500, 502, 503, 504) else "BAD"
     if 300 <= code < 400:
+        # A real session only leaves wp-admin for the front page. A bounce to a
+        # custom /login/ handler (often carrying redirect_to=...wp-admin in the
+        # query) is a failed login.
+        path = urllib.parse.urlparse(loc).path
+        if path.startswith("/wp-admin"):
+            return "OK"
+        if any(k in loc for k in ("error=", "bc-message=", "/login/")):
+            return "BAD"
         # Authenticated sessions may be bounced to the site root by plugins;
         # only a bounce back to the login page proves the session is dead.
         return "OK"

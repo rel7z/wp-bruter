@@ -12,6 +12,10 @@ SSH_USER="${SSH_USER:-root}"
 SSH_PORT="${SSH_PORT:-22}"
 WORKER_PASS="${WORKER_PASS:-fahrel}"
 SSH_KEY="${SSH_KEY:-}"
+# This fleet is key-based; use the shared key unless told otherwise.
+if [ -z "$SSH_KEY" ] && [ -r "$HOME/.ssh/wp_fleet" ]; then
+    SSH_KEY="$HOME/.ssh/wp_fleet"
+fi
 
 SSH_OPTS=(
     -o StrictHostKeyChecking=no

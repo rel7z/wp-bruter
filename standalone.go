@@ -50,21 +50,30 @@ func wantsSupervisor(args []string) bool {
 	return !flagSet("sites")
 }
 
-// installSelf writes a copy beside the running one and renames it into place,
-// because a running binary cannot be overwritten (ETXTBSY).
-func installSelf(self, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+// installAsService copies everything into installDir, writes the unit and
+// starts it, then returns true so the caller exits. A bare ./wp-bruter must not
+// live in an SSH session: closing it sends SIGHUP and the sweep dies.
+func installAsService(self, sites string) bool {
+	if underSystemd() || os.Getuid() != 0 {
+		return false
 	}
-	data, err := os.ReadFile(self)
-	if err != nil {
-		return err
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return false
 	}
-	tmp := dst + ".new"
-	if err := os.WriteFile(tmp, data, 0o755); err != nil {
-		return err
+	if err := establishInstall(self, sites); err != nil {
+		logPrintf("cannot install to %s: %v\n", installDir, err)
+		os.Exit(1)
 	}
-	return os.Rename(tmp, dst)
+	if err := startService(); err != nil {
+		logPrintf("%v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("service wp-bruter active — SSH may be closed now\n\n")
+	fmt.Printf("  systemctl status wp-bruter      # state\n")
+	fmt.Printf("  journalctl -u wp-bruter -f      # live log\n")
+	fmt.Printf("  systemctl stop wp-bruter        # stop\n")
+	fmt.Printf("  %s    # creds\n\n", filepath.Join(installDir, "creds.txt"))
+	return true
 }
 
 // resolveList picks the target list: an explicit -sites wins, otherwise the
@@ -96,44 +105,6 @@ func childArgs(sites string) []string {
 // underSystemd is true inside the unit, so the supervisor stops re-installing.
 func underSystemd() bool {
 	return os.Getenv("INVOCATION_ID") != "" || os.Getenv(superviseEnv) != ""
-}
-
-// installAsService writes the unit and starts it, then returns true so the
-// caller exits. A bare ./wp-bruter must not live in an SSH session: closing it
-// sends SIGHUP and the sweep dies.
-func installAsService(self, sites string) bool {
-	if underSystemd() || os.Getuid() != 0 {
-		return false
-	}
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return false
-	}
-	if err := installSelf(self, filepath.Join(installDir, "wp-bruter")); err != nil {
-		logPrintf("cannot install to %s: %v\n", installDir, err)
-		os.Exit(1)
-	}
-	// Point the unit at the list the operator actually used.
-	cfg := strings.ReplaceAll(defaultConfigEnv, "SITES_FILE=/opt/wp-bruter/wordpress.txt", "SITES_FILE="+sites)
-	if err := os.WriteFile(filepath.Join(installDir, "config.env"), []byte(cfg), 0o600); err != nil {
-		logPrintf("cannot write config: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(servicePath, []byte(serviceFile), 0o644); err != nil {
-		logPrintf("cannot write unit: %v\n", err)
-		os.Exit(1)
-	}
-	exec.Command("systemctl", "daemon-reload").Run()
-	exec.Command("systemctl", "enable", "wp-bruter.service").Run()
-	if out, err := exec.Command("systemctl", "restart", "wp-bruter.service").CombinedOutput(); err != nil {
-		logPrintf("systemctl restart failed: %v\n%s", err, out)
-		os.Exit(1)
-	}
-	fmt.Printf("service wp-bruter started — SSH may be closed now\n\n")
-	fmt.Printf("  systemctl status wp-bruter      # state\n")
-	fmt.Printf("  journalctl -u wp-bruter -f      # live log\n")
-	fmt.Printf("  systemctl stop wp-bruter        # stop\n")
-	fmt.Printf("  %s    # creds\n\n", filepath.Join(installDir, "creds.txt"))
-	return true
 }
 
 // runSupervised raises the fd limit and walks the phases.

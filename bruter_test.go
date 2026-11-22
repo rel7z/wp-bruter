@@ -396,3 +396,43 @@ func Test200LoginPageWithPasswordFieldBeyondSample(t *testing.T) {
 		t.Fatalf("login page with a pwd field must not verify, got %v", outcome)
 	}
 }
+
+// A custom login plugin answers a *failed* login with
+// /login/?redirect_to=...wp-admin/ — the query alone must not look like an
+// admin redirect.
+func TestAdminPathIgnoresQueryString(t *testing.T) {
+	for _, tc := range []struct {
+		url  string
+		want bool
+	}{
+		{"https://x.test/wp-admin/", true},
+		{"https://x.test/wp-admin/index.php", true},
+		{"https://x.test/login/?redirect_to=https%3A%2F%2Fx.test%2Fwp-admin%2F&bc-message=invalid_username", false},
+		{"https://x.test/wp-login.php?redirect_to=/wp-admin/", false},
+		{"/wp-admin/", true},
+		{"", false},
+	} {
+		if got := adminPath(tc.url); got != tc.want {
+			t.Errorf("adminPath(%q) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+// The login form loads wp-admin core CSS, so wpadminbar/admin-bar/dashboard are
+// not proof; only real admin markup is.
+func TestAdminMarkersRejectLoginPage(t *testing.T) {
+	login := []byte(`<html><style>#wpadminbar{}</style><body><div id="wpadminbar"></div><form><input name="pwd"></form></body></html>`)
+	if hasAdminMarkers(login) {
+		t.Fatal("login page markers must not count as admin content")
+	}
+	if !hasPasswordField(login) {
+		t.Fatal("login form must be detected by its pwd field")
+	}
+	admin := []byte(`<body><div id="adminmenu"></div><div id="wpbody-content"></div></body>`)
+	if !hasAdminMarkers(admin) {
+		t.Fatal("admin page must be detected")
+	}
+	if hasPasswordField(admin) {
+		t.Fatal("admin page has no pwd field")
+	}
+}

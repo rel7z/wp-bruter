@@ -5,8 +5,10 @@ Tools: `spread.sh`, `deploy.sh`, `farm.sh`, `watchdog.sh`, `stop.sh`, `monitor.s
 
 ## Fleet
 
-`fleet.txt` — one host per line, login `root` with password `fahrel`
-(override: `WORKER_PASS`). Every script reads this file.
+`fleet.txt` — one host per line. Auth is the key `~/.ssh/wp_fleet` by default
+(override: `SSH_KEY=/path/key`); if that key is absent the scripts fall back to
+`root` with password `WORKER_PASS` (default `fahrel`). Every script reads this
+file.
 
 Shard index is tied to the line position, not to how many hosts answer: a dead
 host keeps its shard and the next deploy resumes it. A host that does not answer
@@ -34,21 +36,45 @@ given up when it turns slow (`-slow-threshold`) or blocks twice in a row.
 
 ## Just run the binary
 
+Build for the workers first — they are linux/amd64 and a macOS binary dies with
+`Exec format error`:
+
+```
+./build.sh
+```
+
 On a box that already has `wordpress.txt` from the CNC, nothing else is needed:
 
 ```
 ./wp-bruter
 ```
 
-It installs itself to `/opt/wp-bruter`, raises the fd limit, then walks the
-attempt phases `150 -> 500 -> 0` and repeats a sweep while progress still grows.
-A phase that dies is retried up to 5 times. `progress.txt` decides what is left,
-so Ctrl-C and a rerun resume where it stopped.
+A bare run installs itself (binary, target list, password list, unit) to
+`/opt/wp-bruter`, writes concrete paths into the unit, starts the service and
+proves it is active before returning. Closing SSH afterwards is safe. There is
+no half-installed state: a copy that fails is reported with its journal tail.
+
+The explicit forms do the same and are the recommended path when scripting:
+
+```
+./wp-bruter --install -sites /root/wordpress.txt -passlist pass.txt
+./wp-bruter --uninstall
+```
+
+`--install` works even on a box that has no list yet (it fails with a clear
+message instead of silently doing nothing), and `--uninstall` never starts a
+sweep first.
+
+It then walks the attempt phases `150 -> 500 -> 0` and repeats a sweep while
+progress still grows. A phase that dies is retried up to 5 times.
+`progress.txt` decides what is left, so Ctrl-C and a rerun resume where it
+stopped.
 
 Flags worth knowing: `-sweeps N` (default 1, stops early when progress stalls),
 `-phase-list 150,500,0`, `-sites /root/wordpress.txt`, `-timeout 5`.
 
 More than one box? Split with the CNC, or hand each box its own `-sites` file.
+`config.env` now holds only `EXTRA_ARGS`; the unit itself carries the paths.
 
 ## Run a list (scripted)
 
@@ -202,6 +228,11 @@ panic).
 
 ## Known noise
 
+- Custom login plugins (WPS Hide Login and friends) redirect a *failed* login to
+  `/login/?redirect_to=...wp-admin/`. Membership in the query string is not
+  proof: a session only counts when the landing path is really under
+  `/wp-admin`, carries admin markup (`adminmenu`, `wpbody-content`) and has no
+  password field. The same rule is in `tools/verify_creds.py`.
 - A 403 host is still attacked (a challenge page rarely exposes the form); the
   block counter ends it after two refusals. `-skip-waf` drops such sites in
   pre-flight instead.
