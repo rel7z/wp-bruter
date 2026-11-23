@@ -197,6 +197,30 @@ Collects `creds.txt` from every box, keeps only credentials whose login sets a
 live `wordpress_logged_in_*` cookie, writes `.verified.txt` / `.unverified.txt`
 beside the input and can push the verified file back to the fleet.
 
+The login POST is not followed on purpose: a host may set the cookie on the 302
+and revoke it on the bounce to `/wp-login.php?reauth=1` (SiteGround), so the
+verdict reads the 302 headers. The host itself is canonicalised first (https,
+www, migrated domain) because a `wp-admin` bounce to https invalidates a cookie
+minted over http. `UNKNOWN` is a real signal — WAF `403`/`429`, edge `5xx`, a
+captcha-gated login or a 502 origin — not a wrong password; those stay in
+`.unverified.txt` for a retry.
+
+## Expand the password list
+
+```
+python3 tools/gen_wordlist.py creds.verified.txt --merge pass.txt
+```
+
+Takes the harvested hits as seeds (password, username, host, and the words
+inside them) and mangles them into the variants an admin picks — suffix
+(`123`, `1`, `2024`..`2026`, `!`, `@`, `.`…), leet (`o`→`0`), capitalisation.
+`--merge` appends only the new words after the existing list and backs the file
+up to `pass.txt.bak`, so the cheap generic guesses keep their place at the
+front. Exact seeds land first, then seed+suffix for every seed, then leet, so a
+`--max` cap still spans all of them.
+
+Offline tests: `python3 tools/test_verify_creds.py`.
+
 ## State on a box (do not delete)
 
 - `/opt/wp-bruter/progress.txt` — per-site offset, resume ledger

@@ -1,0 +1,11 @@
+# verified 2026-11-24 05:40:38 — live logged-in cookie required
+# site | user | pass
+http://www.adsflo.com | adsflo | adsflo
+http://www.bujon.cz | admin | buj0n
+https://broadleafservices.com | admin | admin123
+https://gvult.com | author | test123
+https://landscaping-usa.com | admin | admin
+https://teamworkindustrial.com | cmsuser | msit
+https://the-sakaki-tokyo.com | ookuni | ookuni
+https://thekeyphrase.com | thekeyphrase | thekeyphrase
+https://theotherpress.ca | alex | Zxcvbnm123

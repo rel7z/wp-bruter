@@ -1,0 +1,15 @@
+# unverified: unreachable or ambiguous at check time
+# site | user | pass
+http://bctwealthexplorer.com | ariellemq | ariellemq
+http://enovix.info | admin | test26
+http://mdtutokas.gr | admin | mikas5
+http://miacanalytics.co.uk | darrel | Macpassword123
+http://pfmgmt.app | admin | Webmaster_26
+http://stoke-space.com | admin | AdminPassword123
+http://talkabout.awana.org | aristatawana-org | joshhawana-org#25
+http://topshelfcrm.com | webmaster | mike1
+http://visitmanassas.org | admin | Webmaster!123
+http://www.lvs.no | admin | wordpress
+http://www.shinebysho.com | admin | Contributor#2026
+http://www.visitmanassas.org | admin | HelloWorld
+https://ieltspreponline.com | admin | wordpress123

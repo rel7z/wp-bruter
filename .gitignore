@@ -26,3 +26,6 @@ pass_wordpress.txt
 
 # downloaded target lists
 lists/
+
+# wordlist backups
+*.bak
